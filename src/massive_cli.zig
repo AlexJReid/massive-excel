@@ -9,14 +9,15 @@
 //   zig build run-cli -- T.AAPL T.MSFT
 //   zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true -- T.AAPL
 //
-// The API key is read from src/massive_api_key.txt (same file the XLL embeds).
+// The API key is loaded at runtime from ./massive_api_key.txt (or ./src/massive_api_key.txt
+// for dev convenience when running via `zig build run-cli` from the repo root).
 
 const std = @import("std");
 const ws = @import("ws_client.zig");
 const protocol = @import("massive_protocol.zig");
+const config = @import("config.zig");
 const opts = @import("massive_options");
 
-const api_key_raw = @embedFile("massive_api_key.txt");
 const ca_bundle_pem = @embedFile("ca_bundle.pem");
 
 pub fn main() !void {
@@ -61,7 +62,8 @@ pub fn main() !void {
     defer client.deinit();
     log.info("connected", .{});
 
-    const api_key = std.mem.trim(u8, api_key_raw, " \t\r\n");
+    const api_key = try config.loadApiKey(alloc);
+    defer alloc.free(api_key);
     try protocol.authenticate(client, alloc, api_key);
     log.info("authenticated", .{});
 

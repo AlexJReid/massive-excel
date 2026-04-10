@@ -61,7 +61,11 @@ cp src/massive_api_key.txt.example src/massive_api_key.txt
 # edit src/massive_api_key.txt and paste your key
 ```
 
-The file is `.gitignore`d. The key is embedded into the XLL/CLI at build time via `@embedFile`.
+The key is loaded at **runtime**, not embedded — so you ship one XLL and drop `massive_api_key.txt` next to it (see [Run the XLL in Excel](#run-the-xll-in-excel)). The CLI reads it from `./massive_api_key.txt` or `./src/massive_api_key.txt`. The file is `.gitignore`d.
+
+Alternatively, set the `MASSIVE_API_KEY` environment variable — it takes precedence over the file. Handy for CI or ephemeral shells where you don't want the key on disk.
+
+The key is re-read on every reconnect, so rotating it (on disk or in the env) takes effect without a rebuild.
 
 ## Build
 
@@ -88,9 +92,10 @@ Options:
 
 1. `zig build`
 2. Copy `zig-out/lib/standalone.xll` to your Windows box.
-3. Unblock the file: right-click → Properties → check **Unblock** → OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
-4. Double-click the `.xll` to load it into Excel.
-5. In a cell: `=MASSIVE("T.AAPL.p")`.
+3. Drop `massive_api_key.txt` (containing just your key) **in the same directory** as `standalone.xll`. The XLL loads it at connect time.
+4. Unblock the file: right-click → Properties → check **Unblock** → OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
+5. Double-click the `.xll` to load it into Excel.
+6. In a cell: `=MASSIVE("T.AAPL.p")`.
 
 The RTD server registers itself in `HKCU\Software\Classes` on load — no admin needed.
 
@@ -141,7 +146,7 @@ Mock server environment variables:
 - `MOCK_API_KEY` — default `test-key`
 - `MOCK_TICK_MS` — default `500` (how often to emit fake events per subscribed channel)
 
-**Remember** to put your real key back in `src/massive_api_key.txt` before building for production.
+**Remember** to put your real key back in `src/massive_api_key.txt` before running the CLI against the real endpoint. (The XLL reads from its own directory, so its key file isn't affected by mock-server testing.)
 
 ## Architecture
 

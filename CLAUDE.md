@@ -57,8 +57,15 @@ zig build -Dmassive_host=<host>        # default: delayed.massive.com
 - `src/ca_bundle.pem` — Mozilla CA roots from curl.se. Checked in for
   reproducible builds. Regenerate with `curl -sS -L -o src/ca_bundle.pem https://curl.se/ca/cacert.pem`.
 
-- `src/massive_api_key.txt` — gitignored. `@embedFile`'d at build time into
-  both the XLL and the CLI. There's a `.example` file in the repo.
+- `src/config.zig` — runtime loader for the Massive API key. Checks
+  `$MASSIVE_API_KEY` first, then falls back to `massive_api_key.txt`: the XLL
+  reads it from the directory containing the `.xll` file (via
+  `GetModuleFileNameA`); the native CLI reads from `./massive_api_key.txt`
+  then `./src/massive_api_key.txt`. Key is re-loaded on every reconnect, so
+  rotating it takes effect without a rebuild.
+
+- `src/massive_api_key.txt` — gitignored. Deployed alongside the XLL at runtime;
+  NOT `@embedFile`'d. There's a `.example` file in the repo.
 
 - `build.zig` — declares Windows XLL (cross-compiled MSVC) and native CLI as
   separate compile units. Build options are plumbed through a single `Options`
@@ -174,9 +181,9 @@ up to 16645 + 1024.
 ### `@embedFile` paths are relative to the importing module's package root
 
 The XLL build uses `src/main.zig` as the user module's root. So
-`@embedFile("massive_api_key.txt")` resolves to `src/massive_api_key.txt`,
-NOT `massive_api_key.txt` at the repo root. Anything that needs embedding
-must live under `src/`.
+`@embedFile("ca_bundle.pem")` resolves to `src/ca_bundle.pem`, NOT
+`ca_bundle.pem` at the repo root. Anything that needs embedding must live
+under `src/`.
 
 ### Handler lifecycle and `onConnect` vs `onConnectBatch`
 
@@ -208,7 +215,9 @@ a very good reason.
 - Smoke test: `./tools/gen_cert.sh && npm install ws && node tools/mock_server.js &`
   then `zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true -- T.AAPL T.MSFT`
 - **The mock expects API key `test-key`**. Put the real key back in
-  `src/massive_api_key.txt` before a production build.
+  `src/massive_api_key.txt` (the CLI reads from there) before testing
+  against the real endpoint. No rebuild required — the key is loaded at
+  runtime on every reconnect.
 - There's no `zig build test` target in this repo — the framework has its own.
   You can add `test` blocks to files under `src/`; run them via
   `zig test src/massive_protocol.zig` directly (it has a small topic-parsing test).

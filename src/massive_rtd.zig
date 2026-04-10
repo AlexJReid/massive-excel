@@ -33,13 +33,11 @@ const ws_port: u16 = opts.massive_port;
 const ws_path = opts.massive_path;
 const insecure_tls = opts.massive_insecure;
 
-/// API key is read from `massive_api_key.txt` at build time.
-/// The file is gitignored — see `massive_api_key.txt.example`.
-const api_key_raw = @embedFile("massive_api_key.txt");
-
 /// CA trust bundle. Fetched once from https://curl.se/ca/cacert.pem and
 /// checked into the repo for reproducible builds.
 const ca_bundle_pem = @embedFile("ca_bundle.pem");
+
+const config = @import("config.zig");
 
 // ============================================================================
 // Value state
@@ -305,8 +303,13 @@ fn workerSession(self: *Handler, ctx: *rtd.RtdContext) !void {
     self.active_sock.store(sockToUsize(client.stream.handle), .release);
     defer self.active_sock.store(0, .release);
 
-    // Greet / auth handshake.
-    const api_key = std.mem.trim(u8, api_key_raw, " \t\r\n");
+    // Greet / auth handshake. Key is loaded fresh each session so rotating it
+    // on disk takes effect on the next reconnect — no XLL rebuild needed.
+    const api_key = config.loadApiKey(gpa) catch |err| {
+        rtd.debugLog("massive_rtd: could not load API key ({s}) — place massive_api_key.txt next to the XLL", .{@errorName(err)});
+        return err;
+    };
+    defer gpa.free(api_key);
     try protocol.authenticate(client, gpa, api_key);
     rtd.debugLog("massive_rtd: authenticated", .{});
     self.authed.store(true, .release);
