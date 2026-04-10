@@ -13,7 +13,7 @@
 // (see defaultFieldFor).
 //
 // Usage in Excel:
-//   =RTD("zigxll-connectors-massive", , "T.AAPL.p")
+//   =RTD("zigxll.connectors.massive", , "T.AAPL.p")
 
 const std = @import("std");
 const xll = @import("xll");
@@ -479,8 +479,8 @@ fn makeStringValue(utf8: []const u8) !OwnedValue {
 // ============================================================================
 
 pub const rtd_config: rtd.RtdConfig = .{
-    .clsid = rtd.guid("C1D2E3F4-A5B6-7890-1234-567890ABCDEF"),
-    .prog_id = "zigxll-connectors-massive",
+    .clsid = rtd.guid("D146815B-1D01-4D0D-904C-292533090438"),
+    .prog_id = "zigxll.connectors.massive",
 };
 
 pub const RtdServerType = rtd.RtdServer(Handler, rtd_config);

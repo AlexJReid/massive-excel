@@ -9,12 +9,12 @@ Built with [ZigXLL](https://github.com/AlexJReid/zigxll) — everything is pure 
 In any cell:
 
 ```
-=RTD("zigxll-connectors-massive", , "T.AAPL.p")      last trade price for AAPL
-=RTD("zigxll-connectors-massive", , "T.AAPL.s")      last trade size
-=RTD("zigxll-connectors-massive", , "Q.MSFT.bp")     MSFT bid price
-=RTD("zigxll-connectors-massive", , "Q.MSFT.ap")     MSFT ask price
-=RTD("zigxll-connectors-massive", , "AM.TSLA.vw")    TSLA minute-bar VWAP
-=RTD("zigxll-connectors-massive", , "AM.TSLA.c")     TSLA minute-bar close
+=RTD("zigxll.connectors.massive", , "T.AAPL.p")      last trade price for AAPL
+=RTD("zigxll.connectors.massive", , "T.AAPL.s")      last trade size
+=RTD("zigxll.connectors.massive", , "Q.MSFT.bp")     MSFT bid price
+=RTD("zigxll.connectors.massive", , "Q.MSFT.ap")     MSFT ask price
+=RTD("zigxll.connectors.massive", , "AM.TSLA.vw")    TSLA minute-bar VWAP
+=RTD("zigxll.connectors.massive", , "AM.TSLA.c")     TSLA minute-bar close
 ```
 
 Or use a convenience wrapper — `=MASSIVE(topic)` takes the full topic string, and there's one per-event-type wrapper that takes `sym` plus an optional `field`:
@@ -111,7 +111,7 @@ The RTD server registers itself in `HKCU\Software\Classes` on load — no admin 
 
 | ProgID | CLSID |
 |---|---|
-| `zigxll-connectors-massive` | `{C1D2E3F4-A5B6-7890-1234-567890ABCDEF}` |
+| `zigxll.connectors.massive` | `{D146815B-1D01-4D0D-904C-292533090438}` |
 
 ## Smoke-test without Excel (mac/linux/windows)
 
@@ -165,7 +165,7 @@ Mock server environment variables:
             │  Excel                                   │
             │    │                                     │
             │    ▼                                     │
-            │  =RTD("zigxll-connectors-massive",       │
+            │  =RTD("zigxll.connectors.massive",       │
             │        ,"T.AAPL.p")                      │
             │    │                                     │
             │    ▼                                     │

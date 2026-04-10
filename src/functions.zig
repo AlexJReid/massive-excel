@@ -4,7 +4,7 @@ const ExcelFunction = xll.ExcelFunction;
 const ParamMeta = xll.ParamMeta;
 
 // Convenience wrapper so users can write =MASSIVE("T.AAPL.p") instead of
-// =RTD("zigxll-connectors-massive",,"T.AAPL.p").
+// =RTD("zigxll.connectors.massive",,"T.AAPL.p").
 pub const massive = ExcelFunction(.{
     .name = "MASSIVE",
     .description = "Subscribe to a Massive WebSocket topic (e.g. T.AAPL.p)",
@@ -17,7 +17,7 @@ pub const massive = ExcelFunction(.{
 });
 
 fn massiveFunc(topic: []const u8) !*xll.xl.XLOPER12 {
-    return xll.rtd_call.subscribeDynamic("zigxll-connectors-massive", &.{topic});
+    return xll.rtd_call.subscribeDynamic("zigxll.connectors.massive", &.{topic});
 }
 
 // Per-event convenience wrappers. Each builds "<ev>.<sym>" or "<ev>.<sym>.<field>"
@@ -128,5 +128,5 @@ fn subscribeEvent(ev: []const u8, sym: []const u8, field: ?[]const u8) !*xll.xl.
         try std.fmt.bufPrint(&buf, "{s}.{s}.{s}", .{ ev, sym, f })
     else
         try std.fmt.bufPrint(&buf, "{s}.{s}", .{ ev, sym });
-    return xll.rtd_call.subscribeDynamic("zigxll-connectors-massive", &.{topic});
+    return xll.rtd_call.subscribeDynamic("zigxll.connectors.massive", &.{topic});
 }
