@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+        
+    - name: Setup Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.15.1
+
+    - name: Build example XLL
+      run: zig build
+
+    - name: Upload example XLL artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: zigxll-standalone
+        path: zig-out/lib/standalone.xll
+        if-no-files-found: error
