@@ -17,11 +17,21 @@ In any cell:
 =RTD("zigxll-connectors-massive", , "AM.TSLA.c")     TSLA minute-bar close
 ```
 
-Or use the convenience wrapper:
+Or use a convenience wrapper — `=MASSIVE(topic)` takes the full topic string, and there's one per-event-type wrapper that takes `sym` plus an optional `field`:
 
 ```
-=MASSIVE("T.AAPL.p")
+=MASSIVE("T.AAPL.p")            full topic string
+
+=MASSIVE.TRADE("AAPL")          T.AAPL         (default field: p)
+=MASSIVE.TRADE("AAPL", "s")     T.AAPL.s
+=MASSIVE.QUOTE("MSFT", "bp")    Q.MSFT.bp      (default field: ap)
+=MASSIVE.AGG_MIN("TSLA", "vw")  AM.TSLA.vw     (default field: c)
+=MASSIVE.AGG_SEC("TSLA")        A.TSLA         (default field: c)
+=MASSIVE.FMV("AAPL")            FMV.AAPL       (default field: fmv)
+=MASSIVE.INDEX("SPX")           V.SPX          (default field: val)
 ```
+
+All wrappers delegate to the same RTD server, so subscription refcounting is shared — `=MASSIVE.TRADE("AAPL","p")` and `=RTD(..., "T.AAPL.p")` share one wire subscription.
 
 **Topic format:** `<ev>.<sym>[.<field>]`
 - `<ev>` — Massive event prefix: `T` (trades), `Q` (quotes), `AM` (per-minute aggs), `A` (per-second aggs), `FMV` (fair market value), `V` (index value)

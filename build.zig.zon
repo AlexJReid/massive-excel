@@ -1,7 +1,7 @@
 .{
     .name = .zigxll_massive,
     .version = "0.0.5",
-    .fingerprint = 0x9d00d0bc4a9b218c,
+    .fingerprint = 0x68ae5e05e02c9113,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .xll = .{
