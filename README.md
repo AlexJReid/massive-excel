@@ -45,6 +45,8 @@ There's one Excel UDF per (market, event), so the market is part of the function
 
 <img src="doc/funclist.png" alt="Massive UDFs in Excel's function browser" width="75%">
 
+### Some examples
+
 ```
 =MASSIVE.STOCKS.TRADE("AAPL")                last AAPL trade price (T.AAPL.p)
 =MASSIVE.STOCKS.QUOTE("MSFT","bp")           MSFT best bid (Q.MSFT.bp)
