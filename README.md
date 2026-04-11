@@ -522,4 +522,4 @@ Key source files:
 
 ## A note on AI assistance
 
-Some of the more repetitive work of mirroring the Massive API surface into Excel — the per-event wrapper functions, field mappings, and similar boilerplate — was generated with the help of AI agents. The output has been reviewed, but if you spot something off, please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues).
+Some of the more repetitive work of mirroring the Massive API surface into Excel; the per-event wrapper functions, field mappings, and similar boilerplate was generated with the help of AI agents. The output has been reviewed, but if you spot something off, please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues).
