@@ -1,4 +1,4 @@
-// Massive WebSocket protocol helpers — pure-Zig, no Excel/RTD dependency.
+// Massive WebSocket protocol helpers - pure-Zig, no Excel/RTD dependency.
 // Shared between the RTD handler (Windows XLL) and the native CLI smoke-tester.
 
 const std = @import("std");
@@ -6,7 +6,7 @@ const ws = @import("ws_client.zig");
 
 /// Send auth, wait for auth_success. Returns error.AuthFailed on any other response.
 pub fn authenticate(client: *ws.Client, alloc: std.mem.Allocator, api_key: []const u8) !void {
-    // 1) Server greets with [{"ev":"status","status":"connected",...}] — discard.
+    // 1) Server greets with [{"ev":"status","status":"connected",...}] - discard.
     {
         const msg = try client.readMessage(alloc);
         defer alloc.free(msg.payload);
@@ -74,7 +74,7 @@ pub const ParsedTopic = struct {
     ev: []const u8,
     sym: []const u8,
     field: []const u8,
-    /// Length of the "<ev>.<sym>" prefix — use `topic[0..channel_len]` to get
+    /// Length of the "<ev>.<sym>" prefix - use `topic[0..channel_len]` to get
     /// the channel name that Massive expects on the wire.
     channel_len: usize,
 };

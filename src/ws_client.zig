@@ -3,7 +3,7 @@
 // Only what zigxll-connectors-massive needs:
 //   - wss:// connections (no plain ws://)
 //   - text frames up to 64 KiB
-//   - masked writes (client → server), unmasked reads (server → client)
+//   - masked writes (client -> server), unmasked reads (server -> client)
 //   - auto-pong, auto-close handling
 //
 // Not supported: extensions, fragmentation across frames, large (>64 KiB) messages.
@@ -68,7 +68,7 @@ pub const Client = struct {
     /// return a ready-to-use WebSocket client.
     ///
     /// The client is heap-allocated because `tls.Client` and `net.Stream.Reader`
-    /// hold internal `*Reader`/`*Writer` pointers into their own struct fields —
+    /// hold internal `*Reader`/`*Writer` pointers into their own struct fields -
     /// moving or copying the parent would invalidate those pointers.
     ///
     /// `host` is the DNS name (used for SNI + cert verification).
@@ -112,7 +112,7 @@ pub const Client = struct {
             .tls_write_buf = tls_write_buf,
         };
 
-        // `self` is now stable on the heap — safe to store pointers into fields.
+        // `self` is now stable on the heap - safe to store pointers into fields.
         self.tls_client = try tls.Client.init(
             self.stream_reader.interface(),
             &self.stream_writer.interface,
@@ -152,7 +152,7 @@ pub const Client = struct {
         return &self.tls_client.writer;
     }
 
-    /// Flush the full TLS → socket writer chain. TLS `Client.writer.flush()`
+    /// Flush the full TLS -> socket writer chain. TLS `Client.writer.flush()`
     /// only encrypts into the socket writer's buffer; the socket writer itself
     /// must be flushed to push bytes to the kernel.
     fn flushChain(self: *Client) !void {
@@ -184,7 +184,7 @@ pub const Client = struct {
 
         // Parse response line by line until blank line.
         // Note: we can't use takeDelimiterInclusive on the TLS reader because
-        // of a Reader.stream() contract mismatch in std 0.15.1 — the TLS client
+        // of a Reader.stream() contract mismatch in std 0.15.1 - the TLS client
         // advances `r.end` directly but returns 0, and peekDelimiterInclusive
         // only searches `end_cap[0..n]` instead of the full buffer. Use takeByte
         // instead, which works correctly because it goes through fill/peek.
@@ -290,7 +290,7 @@ pub const Client = struct {
 
     /// Read the next **application** message (text/binary) from the server,
     /// transparently handling ping/pong and close frames.
-    /// Returns a heap-allocated payload — caller owns.
+    /// Returns a heap-allocated payload - caller owns.
     pub fn readMessage(self: *Client, alloc: std.mem.Allocator) !Message {
         while (true) {
             const frame = try self.readRawFrame(alloc);
@@ -315,6 +315,38 @@ pub const Client = struct {
                 },
             }
         }
+    }
+
+    /// Same as `readMessage`, but returns `error.Timeout` if no frame arrives
+    /// within `timeout_ms`. Data already buffered in the TLS / socket readers
+    /// is processed immediately; we only poll the socket when the buffers are
+    /// empty, so this never blocks in the middle of a partial frame.
+    pub fn readMessageTimeout(self: *Client, alloc: std.mem.Allocator, timeout_ms: i32) !Message {
+        if (!self.hasBufferedData()) {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const n = try std.posix.poll(&fds, timeout_ms);
+            if (n == 0) return error.Timeout;
+        }
+        return self.readMessage(alloc);
+    }
+
+    /// True if plaintext is already buffered in the TLS reader OR ciphertext
+    /// is already buffered in the underlying socket reader. In either case a
+    /// subsequent `readMessage` call will make progress without hitting the
+    /// kernel.
+    fn hasBufferedData(self: *Client) bool {
+        if (self.tls_client.reader.bufferedLen() > 0) return true;
+        if (self.stream_reader.interface().bufferedLen() > 0) return true;
+        return false;
+    }
+
+    /// Send a WebSocket ping frame with the given payload.
+    pub fn sendPing(self: *Client, payload: []const u8) !void {
+        try self.sendFrame(.ping, payload);
     }
 
     fn readRawFrame(self: *Client, alloc: std.mem.Allocator) !Message {
@@ -373,7 +405,7 @@ fn readLine(r: *Reader, buf: []u8) ![]const u8 {
             return buf[0..i];
         }
         if (b == '\n') {
-            // Bare LF — tolerate.
+            // Bare LF - tolerate.
             return buf[0..i];
         }
         buf[i] = b;
@@ -388,7 +420,7 @@ fn readLine(r: *Reader, buf: []u8) ![]const u8 {
 
 /// Populate a Certificate.Bundle from a single PEM blob containing multiple
 /// "-----BEGIN CERTIFICATE-----" blocks. Copies `pem` into the bundle's
-/// scratch space — `pem` can be `@embedFile`'d read-only memory.
+/// scratch space - `pem` can be `@embedFile`'d read-only memory.
 pub fn loadCaBundleFromPem(
     allocator: std.mem.Allocator,
     pem: []const u8,

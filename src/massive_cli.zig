@@ -1,13 +1,18 @@
 // Native CLI smoke-tester for the Massive WebSocket client.
 //
-// Builds on mac/linux/windows as a plain executable — no Excel, no COM, no XLL.
+// Builds on mac/linux/windows as a plain executable - no Excel, no COM, no XLL.
 // Connects to the configured Massive endpoint (or a local mock via build options),
 // authenticates, subscribes to the channels given on the command line, and prints
 // every event it receives.
 //
 // Usage:
 //   zig build run-cli -- T.AAPL T.MSFT
+//   zig build run-cli -- --market crypto XT.BTC-USD
 //   zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true -- T.AAPL
+//
+// The `--market <name>` flag picks the WebSocket path (/stocks, /crypto,
+// /forex, /options, /indices, /futures). Without it we use the default path
+// from the -Dmassive_path build option.
 //
 // The API key is loaded at runtime from ./massive_api_key.txt (or ./src/massive_api_key.txt
 // for dev convenience when running via `zig build run-cli` from the repo root).
@@ -28,21 +33,32 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    if (args.len < 2) {
+    // Parse args: optional "--market <name>" then positional channel list.
+    var path: []const u8 = opts.massive_path;
+    var arg_i: usize = 1;
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--market")) {
+        const market = args[2];
+        var path_buf: [32]u8 = undefined;
+        const owned_path = try std.fmt.bufPrint(&path_buf, "/{s}", .{market});
+        path = try alloc.dupe(u8, owned_path);
+        arg_i = 3;
+    }
+    if (args.len <= arg_i) {
         const stderr = std.debug.lockStderrWriter(&.{});
         defer std.debug.unlockStderrWriter();
-        stderr.writeAll("usage: massive-cli <channel1> [channel2] ...\n") catch {};
+        stderr.writeAll("usage: massive-cli [--market <name>] <channel1> [channel2] ...\n") catch {};
         stderr.writeAll("example: massive-cli T.AAPL T.MSFT AM.TSLA\n") catch {};
+        stderr.writeAll("example: massive-cli --market crypto XT.BTC-USD\n") catch {};
         std.process.exit(2);
     }
 
-    const channels = args[1..];
+    const channels = args[arg_i..];
 
     const log = std.log.scoped(.massive_cli);
     log.info("host={s} port={d} path={s} insecure={}", .{
         opts.massive_host,
         opts.massive_port,
-        opts.massive_path,
+        path,
         opts.massive_insecure,
     });
     if (opts.massive_insecure) log.warn("TLS verification disabled", .{});
@@ -55,7 +71,7 @@ pub fn main() !void {
         alloc,
         opts.massive_host,
         opts.massive_port,
-        opts.massive_path,
+        path,
         bundle,
         .{ .insecure_skip_verify = opts.massive_insecure },
     );
@@ -70,7 +86,7 @@ pub fn main() !void {
     try protocol.subscribe(client, alloc, channels);
     log.info("subscribed to {d} channel(s)", .{channels.len});
 
-    // Read loop — print every event forever.
+    // Read loop - print every event forever.
     while (true) {
         const msg = client.readMessage(alloc) catch |err| {
             log.err("read failed: {s}", .{@errorName(err)});

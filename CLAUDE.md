@@ -8,6 +8,15 @@ An Excel XLL that streams live market data from the **Massive** WebSocket API
 into Excel cells via RTD. Also ships a **native CLI** that exercises the same
 TLS+WS+JSON stack on mac/linux/windows without needing Excel.
 
+Massive exposes one WebSocket per asset-class market (`wss://.../stocks`,
+`wss://.../crypto`, `.../forex`, `.../options`, `.../indices`, `.../futures`).
+A single connection can only carry channels for one market, so the RTD
+handler holds a **pool** of per-market connections, each with its own worker
+thread. Which markets you can actually reach is determined by your API key's
+Massive plan entitlements — cells referencing unauthorized markets will fail
+auth and stay `#N/A`. Nothing in the XLL knows ahead of time what you're
+entitled to.
+
 Built on the [ZigXLL](https://github.com/AlexJReid/zigxll) framework. No C deps,
 no npm deps for the XLL itself. The mock server uses `ws` (Node) only for local
 smoke testing.
@@ -25,9 +34,15 @@ Build options (flow through to both the XLL and the CLI via an `Options` module)
 ```bash
 zig build -Dmassive_host=<host>        # default: delayed.massive.com
           -Dmassive_port=<port>        # default: 443
-          -Dmassive_path=<path>        # default: /stocks
+          -Dmassive_path=<path>        # default: /stocks (interpreted as "default market")
           -Dmassive_insecure=true      # skip TLS verification (LOCAL MOCK ONLY)
 ```
+
+`massive_path` is now interpreted as the **default market** - `/stocks` means
+"if the user's topic doesn't name a market, route it to the stocks feed".
+Each market the workbook actually subscribes to gets its own connection
+regardless of what this option is set to; it only decides the default for
+unqualified topics.
 
 ## Code layout
 
@@ -40,16 +55,22 @@ zig build -Dmassive_host=<host>        # default: delayed.massive.com
   `subscribe()`, `unsubscribe()`, `parseTopic()`, `defaultFieldFor()`.
   Shared between the RTD handler and the CLI, hence the extraction.
 
-- `src/massive_rtd.zig` — The RTD `Handler` struct + worker thread. Where
-  most of the interesting business logic lives: topic registration, per-channel
-  refcounting, JSON event dispatch, reconnect loop.
+- `src/massive_rtd.zig` — The RTD `Handler` struct plus a pool of
+  `MarketConn` structs (one per active market), each with its own worker
+  thread, TLS+WS client, channel refcounts, pending sub/unsub queues, and
+  frame arena. The Handler owns a flat `topics` map keyed by `topic_id` that
+  carries a `market` field, so dispatch from a given MarketConn's worker only
+  touches topics belonging to its market. MarketConns are created lazily on
+  the first `onConnect` for a new market, and live until `onTerminate`.
 
 - `src/massive_cli.zig` — `main()` for the native CLI. Loads the same API key
   and CA bundle, calls the same `ws_client` and `massive_protocol` helpers,
   prints decoded events.
 
-- `src/functions.zig` — The `=MASSIVE(topic)` convenience wrapper (an
-  `ExcelFunction` that calls `rtd_call.subscribeDynamic`).
+- `src/functions.zig` — `=MASSIVE(topic[, market])` plus per-event wrappers
+  (`=MASSIVE.TRADE`, `=MASSIVE.QUOTE`, ...). All of them accept an optional
+  trailing `market` argument that maps to the second RTD string parameter,
+  and delegate to `rtd_call.subscribeDynamic`.
 
 - `src/main.zig` — ZigXLL framework entry: declares `function_modules` and
   `rtd_servers`.
@@ -101,27 +122,59 @@ extend that with an optional `.<field>` suffix (e.g. `T.AAPL.p`). The field
 is stripped before subscribing on the wire — many topics can share one
 subscription.
 
-## Topic parsing and refcounting
+## Topic parsing, market routing, and refcounting
 
 `src/massive_protocol.zig:parseTopic` returns `.ev`, `.sym`, `.field`, and
 `.channel_len`. The **channel** is always `topic[0..channel_len]`, i.e. the
 wire-level string we send to Massive.
 
-The RTD handler keeps:
+The Handler keeps a single flat map:
 
 - `topics: AutoHashMap(topic_id → TopicState)` — one entry per live cell.
+  Each `TopicState` carries a `market` field (borrowed from the owning
+  `MarketConn.name`) so dispatch and `onDisconnect` know which connection
+  the topic belongs to.
+
+Each MarketConn keeps:
+
 - `channel_refs: StringHashMap(channel → refcount)` — decides when to send
-  `subscribe` and `unsubscribe`. Key is **owned** by the map.
+  `subscribe` / `unsubscribe` on THIS market's wire. Key is owned by the map.
+- `pending_sub: ArrayList([]u8)` + `pending_unsub` — queued actions that the
+  worker thread drains between reads.
 
-Two cells for `T.AAPL.p` and `T.AAPL.s` share one wire subscription:
-first `onConnect` inc's refcount from 0 to 1 and queues `subscribe T.AAPL`;
-second `onConnect` inc's from 1 to 2, queues nothing. `onDisconnect`
-decrements; at 0 it queues `unsubscribe T.AAPL`.
+Refcounts are **per-market**. If two different markets ever had the same
+channel name they'd be counted independently, because each lives in a
+different MarketConn's map. (In practice the six Massive markets use
+distinct event prefixes so this is more defensive than necessary.)
 
-The worker thread drains these queues between incoming messages. **Known
-latency:** off-hours (no incoming traffic), queued sub/unsub won't flush until
-any frame arrives. Acceptable for a first cut, not trivial to fix without
-non-blocking I/O.
+The second RTD string parameter picks the market. `onConnect` reads
+`entry.strings[1]` (defaults to the build-option default market),
+validates it against `isKnownMarket`, calls `getOrCreateMarketLocked` to
+find-or-spawn a MarketConn + worker thread, then updates both `topics`
+and the MarketConn's channel_refs. `onDisconnect` reverses this under
+the MarketConn's own mutex.
+
+`getOrCreateMarketLocked` is called with `Handler.mu` held. It never takes
+`MarketConn.mu`, so there's no lock-order inversion to worry about — the two
+mutexes are only ever held in the same order (Handler, then MarketConn) and
+only in the onConnect path. `onDisconnect` takes the same order.
+
+### Read loop / latency workaround
+
+Each worker uses `readMessageTimeout` (posix `poll` on the raw socket with a
+2s timeout, plus a bufferedness check on the TLS and socket readers so we
+never poll away from data that's already arrived). On timeout it loops back
+to `flushPending`, so queued sub/unsub actions flush promptly even during
+idle periods. The worker also sends a client-initiated WS ping every 20s to
+keep NAT mappings warm and surface dead connections.
+
+### Dispatch fan-out
+
+`handleDataMessage` is called from a specific MarketConn's worker. It
+acquires `Handler.mu`, iterates `handler.topics`, and **skips any topic
+whose `market` field doesn't match `mc.name`**. This is the firewall
+between markets: an event off the crypto feed can never accidentally
+update a stocks cell even if the `<ev>.<sym>` happens to collide.
 
 ## Gotchas, traps, and things that bit me during development
 
@@ -216,9 +269,16 @@ a very good reason.
   then `zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true -- T.AAPL T.MSFT`
 - **The mock expects API key `test-key`**. Put the real key back in
   `src/massive_api_key.txt` (the CLI reads from there) before testing
-  against the real endpoint. No rebuild required — the key is loaded at
+  against the real endpoint. No rebuild required - the key is loaded at
   runtime on every reconnect.
-- There's no `zig build test` target in this repo — the framework has its own.
+- Mock-targeting XLL: the same `-D` flags work on `zig build` (the XLL target),
+  not just `run-cli`. Example for a Windows VM pointing at a mac-hosted mock:
+  `zig build -Dmassive_host=10.0.2.2 -Dmassive_port=8443 -Dmassive_insecure=true`.
+  Ship the resulting `.xll` + `massive_api_key.txt` (containing `test-key`) to
+  the Windows box. **Keep mock XLLs in a separate directory from production
+  builds** - `-Dmassive_insecure=true` disables TLS verification for every
+  connection the XLL makes, so a mock build must never see real endpoints.
+- There's no `zig build test` target in this repo - the framework has its own.
   You can add `test` blocks to files under `src/`; run them via
   `zig test src/massive_protocol.zig` directly (it has a small topic-parsing test).
 

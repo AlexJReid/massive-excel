@@ -1,7 +1,23 @@
 // Massive WebSocket RTD server.
 //
-// Connects to wss://delayed.massive.com/stocks, authenticates with an API key
-// embedded at build time, and streams JSON events into Excel cells.
+// Connects to one or more Massive WebSocket endpoints (one per asset-class
+// market), authenticates with an API key loaded at runtime, and streams JSON
+// events into Excel cells.
+//
+// Massive exposes a separate WebSocket for each market:
+//
+//   wss://<host>/stocks     wss://<host>/crypto     wss://<host>/forex
+//   wss://<host>/options    wss://<host>/indices    wss://<host>/futures
+//
+// A single WebSocket connection can only talk to one market. If a user
+// subscribes to both stocks and crypto channels, we open two connections.
+// Each connection is owned by its own worker thread and can only carry
+// channels for that market. Connections are created lazily when the first
+// cell for a market appears, and kept alive (idle) for the remainder of the
+// Excel session.
+//
+// Your access to any given market depends on the plan attached to the API
+// key; unauthorized markets will fail auth (reported via status messages).
 //
 // Topic format: "<ev>.<sym>[.<field>]"
 //   T.AAPL.p      -> last trade price for AAPL
@@ -9,11 +25,15 @@
 //   Q.MSFT.bp     -> bid price for MSFT (from quotes feed)
 //   AM.TSLA.vw    -> VWAP from per-minute aggregate
 //
+// Market selection: an optional second RTD string picks the market. When
+// omitted we use the default market from the build option.
+//
+//   =RTD("zigxll.connectors.massive", , "T.AAPL.p")            -> stocks
+//   =RTD("zigxll.connectors.massive", , "XT.BTC-USD.p", "crypto")
+//   =RTD("zigxll.connectors.massive", , "C.EUR/USD.p", "forex")
+//
 // If the field is omitted, a sensible default per event type is returned
 // (see defaultFieldFor).
-//
-// Usage in Excel:
-//   =RTD("zigxll.connectors.massive", , "T.AAPL.p")
 
 const std = @import("std");
 const xll = @import("xll");
@@ -25,13 +45,21 @@ const opts = @import("massive_options");
 const gpa = std.heap.c_allocator;
 
 // ============================================================================
-// Configuration (from build options — see build.zig)
+// Configuration (from build options - see build.zig)
 // ============================================================================
 
 const ws_host = opts.massive_host;
 const ws_port: u16 = opts.massive_port;
-const ws_path = opts.massive_path;
 const insecure_tls = opts.massive_insecure;
+
+/// Default market used when a topic omits the market parameter. Derived from
+/// the legacy `massive_path` build option (e.g. "/stocks" -> "stocks") so
+/// existing users keep their implicit stocks feed.
+const default_market: []const u8 = blk: {
+    const p = opts.massive_path;
+    if (p.len > 0 and p[0] == '/') break :blk p[1..];
+    break :blk p;
+};
 
 /// CA trust bundle. Fetched once from https://curl.se/ca/cacert.pem and
 /// checked into the repo for reproducible builds.
@@ -43,7 +71,7 @@ const config = @import("config.zig");
 // Value state
 // ============================================================================
 
-/// Owned RTD value — when .string, the u16 slice is heap-allocated.
+/// Owned RTD value - when .string, the u16 slice is heap-allocated.
 const OwnedValue = union(enum) {
     int: i32,
     double: f64,
@@ -81,8 +109,11 @@ const TopicState = struct {
     ev: []const u8,
     /// Symbol ("AAPL"), borrowed from `topic`.
     sym: []const u8,
-    /// Field name ("p"), borrowed from `topic` — empty if not specified.
+    /// Field name ("p"), borrowed from `topic` - empty if not specified.
     field: []const u8,
+    /// Which MarketConn this topic belongs to. Borrowed from the market's
+    /// owned name string in `Handler.markets`.
+    market: []const u8,
     /// Last known value for this cell.
     value: OwnedValue = .{ .err = @bitCast(@as(u32, 0x80020004)) }, // #N/A
 
@@ -92,36 +123,80 @@ const TopicState = struct {
 };
 
 // ============================================================================
-// Handler
+// Per-market connection
 // ============================================================================
 
-const Handler = struct {
-    // --- Background thread state ---
-    worker_thread: ?std.Thread = null,
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    authed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+/// One WebSocket connection, one worker thread, one market. Multiple
+/// MarketConns live under a single Handler when the workbook subscribes to
+/// topics from different markets.
+const MarketConn = struct {
+    /// Owned market name ("stocks", "crypto", ...). Keys the Handler.markets
+    /// map AND is borrowed by every TopicState pointing at this connection.
+    name: []const u8,
+    /// Backpointer so the worker thread can reach the shared Handler for
+    /// dispatch into the topics map and Excel notification.
+    handler: *Handler,
 
-    /// Socket handle shared with the worker so `onTerminate` can force-close
+    // --- Background thread state (written by Handler, read by worker) ---
+    worker_thread: ?std.Thread = null,
+    authed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Socket handle shared with Handler.onTerminate so it can force-close
     /// the in-flight read. 0 = no active socket.
     active_sock: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // --- Protected by `mu` ---
     mu: std.Thread.Mutex = .{},
-    topics: std.AutoHashMapUnmanaged(rtd.LONG, TopicState) = .empty,
-    /// Channel → refcount. The key is owned by this map (independent alloc).
+    /// Channel -> refcount. The key is owned by this map (independent alloc).
     channel_refs: std.StringHashMapUnmanaged(u32) = .empty,
     /// Queued subscribe/unsubscribe actions for the worker thread to flush.
-    /// Strings in these lists are owned — the worker frees them after flushing.
+    /// Strings in these lists are owned - the worker frees them after flushing.
     pending_sub: std.ArrayListUnmanaged([]u8) = .empty,
     pending_unsub: std.ArrayListUnmanaged([]u8) = .empty,
 
+    /// Scratch arena reset once per incoming WS frame - owns the JSON parse
+    /// tree and any transient stringification buffers for that frame.
+    /// Only touched from the worker thread inside handleDataMessage.
+    frame_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator),
+
+    fn deinit(self: *MarketConn) void {
+        // Free channel_refs keys.
+        var cit = self.channel_refs.iterator();
+        while (cit.next()) |e| gpa.free(e.key_ptr.*);
+        self.channel_refs.deinit(gpa);
+
+        for (self.pending_sub.items) |s| gpa.free(s);
+        self.pending_sub.deinit(gpa);
+        for (self.pending_unsub.items) |s| gpa.free(s);
+        self.pending_unsub.deinit(gpa);
+
+        self.frame_arena.deinit();
+
+        gpa.free(self.name);
+    }
+};
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+const Handler = struct {
+    ctx: ?*rtd.RtdContext = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Protects `topics` and `markets`. Per-market state has its own mutex
+    /// inside MarketConn.
+    mu: std.Thread.Mutex = .{},
+    topics: std.AutoHashMapUnmanaged(rtd.LONG, TopicState) = .empty,
+    /// Active connections keyed by market name. Values are heap-allocated and
+    /// owned by this map.
+    markets: std.StringHashMapUnmanaged(*MarketConn) = .empty,
+
     pub fn onStart(self: *Handler, ctx: *rtd.RtdContext) void {
-        rtd.debugLog("massive_rtd: onStart", .{});
+        rtd.debugLog("massive_rtd: onStart (default_market={s})", .{default_market});
+        self.ctx = ctx;
         self.running.store(true, .release);
-        self.worker_thread = std.Thread.spawn(.{}, workerMain, .{ self, ctx }) catch |err| {
-            rtd.debugLog("massive_rtd: failed to spawn worker: {s}", .{@errorName(err)});
-            return;
-        };
+        // Workers are spawned lazily when the first topic for a given market
+        // arrives (see onConnect -> getOrCreateMarket).
     }
 
     pub fn onConnect(self: *Handler, ctx: *rtd.RtdContext, topic_id: rtd.LONG, _: usize) void {
@@ -130,19 +205,32 @@ const Handler = struct {
         const entry = ctx.topics.get(topic_id) orelse return;
         if (entry.strings.len == 0) return;
         const topic_str = entry.strings[0];
+        const market_str = if (entry.strings.len >= 2 and entry.strings[1].len > 0)
+            entry.strings[1]
+        else
+            default_market;
 
         _ = protocol.parseTopic(topic_str) catch |err| {
             rtd.debugLog("massive_rtd: bad topic '{s}': {s}", .{ topic_str, @errorName(err) });
             return;
         };
+        if (!isKnownMarket(market_str)) {
+            rtd.debugLog("massive_rtd: unknown market '{s}' for topic '{s}'", .{ market_str, topic_str });
+            return;
+        }
 
         const owned_topic = gpa.dupe(u8, topic_str) catch return;
-        // Re-parse against the owned copy so the borrowed slices are stable across
-        // `topic_str`'s lifetime.
+        errdefer gpa.free(owned_topic);
+        // Re-parse against the owned copy so the borrowed slices are stable.
         const owned = protocol.parseTopic(owned_topic) catch unreachable;
 
         self.mu.lock();
         defer self.mu.unlock();
+
+        const mc = self.getOrCreateMarketLocked(market_str) orelse {
+            gpa.free(owned_topic);
+            return;
+        };
 
         self.topics.put(gpa, topic_id, .{
             .topic = owned_topic,
@@ -150,30 +238,33 @@ const Handler = struct {
             .ev = owned.ev,
             .sym = owned.sym,
             .field = owned.field,
+            .market = mc.name,
         }) catch {
             gpa.free(owned_topic);
             return;
         };
 
-        // Bump channel refcount; queue a subscribe if first time for this channel.
+        // Bump channel refcount on the market connection. The refcount map is
+        // protected by mc.mu, NOT Handler.mu, so we lock it for this section.
         const channel = owned_topic[0..owned.channel_len];
-        if (self.channel_refs.getEntry(channel)) |ref| {
+        mc.mu.lock();
+        defer mc.mu.unlock();
+
+        if (mc.channel_refs.getEntry(channel)) |ref| {
             ref.value_ptr.* += 1;
         } else {
             const owned_channel = gpa.dupe(u8, channel) catch return;
-            self.channel_refs.put(gpa, owned_channel, 1) catch {
+            mc.channel_refs.put(gpa, owned_channel, 1) catch {
                 gpa.free(owned_channel);
                 return;
             };
-            // Queue subscribe — dupe so the pending queue owns the string independently.
             const queued = gpa.dupe(u8, channel) catch return;
-            self.pending_sub.append(gpa, queued) catch gpa.free(queued);
+            mc.pending_sub.append(gpa, queued) catch gpa.free(queued);
         }
     }
 
     pub fn onConnectBatch(_: *Handler, _: *rtd.RtdContext, _: []const rtd.LONG) void {
-        // No-op: registration already happened per-topic in onConnect. The
-        // worker thread will notice queued subscribes in its next poll.
+        // No-op: registration already happened per-topic in onConnect.
     }
 
     pub fn onDisconnect(self: *Handler, _: *rtd.RtdContext, topic_id: rtd.LONG, _: usize) void {
@@ -181,17 +272,21 @@ const Handler = struct {
         defer self.mu.unlock();
 
         const removed = self.topics.fetchRemove(topic_id) orelse return;
-        // Compute channel *before* we free `topic`.
+        const market = removed.value.market;
         const channel = removed.value.topic[0..removed.value.channel_len];
 
-        if (self.channel_refs.getEntry(channel)) |ref| {
-            if (ref.value_ptr.* > 1) {
-                ref.value_ptr.* -= 1;
-            } else {
-                // Reclaim the map's owned key for the pending-unsub queue.
-                const owned_key = @constCast(ref.key_ptr.*);
-                _ = self.channel_refs.remove(channel);
-                self.pending_unsub.append(gpa, owned_key) catch gpa.free(owned_key);
+        if (self.markets.get(market)) |mc| {
+            mc.mu.lock();
+            defer mc.mu.unlock();
+
+            if (mc.channel_refs.getEntry(channel)) |ref| {
+                if (ref.value_ptr.* > 1) {
+                    ref.value_ptr.* -= 1;
+                } else {
+                    const owned_key = @constCast(ref.key_ptr.*);
+                    _ = mc.channel_refs.remove(channel);
+                    mc.pending_unsub.append(gpa, owned_key) catch gpa.free(owned_key);
+                }
             }
         }
 
@@ -211,25 +306,32 @@ const Handler = struct {
         rtd.debugLog("massive_rtd: onTerminate", .{});
         self.running.store(false, .release);
 
-        // Unblock the worker thread's in-flight socket read by forcing the
-        // socket closed. The worker is likely parked inside readMessage.
-        const sock = self.active_sock.swap(0, .acq_rel);
-        if (sock != 0) {
-            const handle: std.net.Stream.Handle = @ptrFromInt(sock);
-            _ = handle;
-            // On posix, fd is an int. On Windows, SOCKET is a usize-like handle.
-            // Either way, closesocket/close() will interrupt a blocking recv.
-            closeSocket(sock);
+        // Snapshot the market list so we can iterate without holding the
+        // handler mutex (join may block).
+        self.mu.lock();
+        var market_list: std.ArrayListUnmanaged(*MarketConn) = .empty;
+        defer market_list.deinit(gpa);
+        var mit = self.markets.iterator();
+        while (mit.next()) |e| market_list.append(gpa, e.value_ptr.*) catch {};
+        self.mu.unlock();
+
+        // Interrupt each worker's in-flight read by force-closing its socket,
+        // then join.
+        for (market_list.items) |mc| {
+            const sock = mc.active_sock.swap(0, .acq_rel);
+            if (sock != 0) closeSocket(sock);
+        }
+        for (market_list.items) |mc| {
+            if (mc.worker_thread) |t| {
+                t.join();
+                mc.worker_thread = null;
+            }
         }
 
-        if (self.worker_thread) |t| {
-            t.join();
-            self.worker_thread = null;
-        }
-
-        // Free owned state.
+        // Free all owned state.
         self.mu.lock();
         defer self.mu.unlock();
+
         var it = self.topics.iterator();
         while (it.next()) |e| {
             gpa.free(e.value_ptr.topic);
@@ -237,16 +339,56 @@ const Handler = struct {
         }
         self.topics.deinit(gpa);
 
-        var cit = self.channel_refs.iterator();
-        while (cit.next()) |e| gpa.free(e.key_ptr.*);
-        self.channel_refs.deinit(gpa);
+        var mit2 = self.markets.iterator();
+        while (mit2.next()) |e| {
+            const mc = e.value_ptr.*;
+            mc.deinit();
+            gpa.destroy(mc);
+        }
+        self.markets.deinit(gpa);
+    }
 
-        for (self.pending_sub.items) |s| gpa.free(s);
-        self.pending_sub.deinit(gpa);
-        for (self.pending_unsub.items) |s| gpa.free(s);
-        self.pending_unsub.deinit(gpa);
+    /// Caller must hold self.mu.
+    fn getOrCreateMarketLocked(self: *Handler, market: []const u8) ?*MarketConn {
+        if (self.markets.get(market)) |mc| return mc;
+
+        const owned_name = gpa.dupe(u8, market) catch return null;
+        errdefer gpa.free(owned_name);
+
+        const mc = gpa.create(MarketConn) catch {
+            gpa.free(owned_name);
+            return null;
+        };
+        mc.* = .{ .name = owned_name, .handler = self };
+
+        self.markets.put(gpa, owned_name, mc) catch {
+            gpa.destroy(mc);
+            gpa.free(owned_name);
+            return null;
+        };
+
+        // Spawn the worker thread. The thread captures the MarketConn pointer
+        // directly; it's stable for the remainder of the Excel session.
+        mc.worker_thread = std.Thread.spawn(.{}, workerMain, .{mc}) catch |err| {
+            rtd.debugLog("massive_rtd: failed to spawn worker for {s}: {s}", .{ market, @errorName(err) });
+            // Leave mc in place but without a thread - onTerminate will clean
+            // it up. Don't unwind the map insert because the topic refcount is
+            // about to be added to it.
+            return mc;
+        };
+
+        rtd.debugLog("massive_rtd: opened market connection for '{s}'", .{market});
+        return mc;
     }
 };
+
+/// Known Massive market names. Matches the documented set of per-market WS
+/// paths: stocks, options, forex, crypto, indices, futures.
+fn isKnownMarket(name: []const u8) bool {
+    const known = [_][]const u8{ "stocks", "options", "forex", "crypto", "indices", "futures" };
+    for (known) |k| if (std.mem.eql(u8, name, k)) return true;
+    return false;
+}
 
 fn closeSocket(raw: usize) void {
     // Cross-platform socket close. net.Stream.Handle is SOCKET on Windows
@@ -265,110 +407,135 @@ fn sockToUsize(h: std.net.Stream.Handle) usize {
 }
 
 // ============================================================================
-// Worker thread
+// Worker thread (one per MarketConn)
 // ============================================================================
 
-fn workerMain(self: *Handler, ctx: *rtd.RtdContext) void {
-    rtd.debugLog("massive_rtd: worker starting", .{});
+fn workerMain(mc: *MarketConn) void {
+    rtd.debugLog("massive_rtd: [{s}] worker starting", .{mc.name});
 
-    while (self.running.load(.acquire)) {
-        workerSession(self, ctx) catch |err| {
-            rtd.debugLog("massive_rtd: session error: {s}", .{@errorName(err)});
+    while (mc.handler.running.load(.acquire)) {
+        workerSession(mc) catch |err| {
+            rtd.debugLog("massive_rtd: [{s}] session error: {s}", .{ mc.name, @errorName(err) });
         };
-        self.authed.store(false, .release);
+        mc.authed.store(false, .release);
 
         // Backoff before reconnect.
         var slept_ms: u64 = 0;
-        while (slept_ms < 2000 and self.running.load(.acquire)) {
+        while (slept_ms < 2000 and mc.handler.running.load(.acquire)) {
             std.Thread.sleep(100 * std.time.ns_per_ms);
             slept_ms += 100;
         }
     }
-    rtd.debugLog("massive_rtd: worker stopped", .{});
+    rtd.debugLog("massive_rtd: [{s}] worker stopped", .{mc.name});
 }
 
-fn workerSession(self: *Handler, ctx: *rtd.RtdContext) !void {
-    // Load CA bundle (once per session — cheap, PEM parse).
+fn workerSession(mc: *MarketConn) !void {
+    // Load CA bundle (once per session - cheap, PEM parse).
     var bundle = try ws.loadCaBundleFromPem(gpa, ca_bundle_pem);
     defer bundle.deinit(gpa);
 
-    rtd.debugLog("massive_rtd: connecting to {s}:{d}{s} (insecure={})", .{ ws_host, ws_port, ws_path, insecure_tls });
-    if (insecure_tls) rtd.debugLog("massive_rtd: WARNING — TLS verification disabled", .{});
-    const client = try ws.Client.connect(gpa, ws_host, ws_port, ws_path, bundle, .{
+    // Each market has its own wire path: /stocks, /crypto, ...
+    var path_buf: [32]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/{s}", .{mc.name});
+
+    rtd.debugLog("massive_rtd: [{s}] connecting to {s}:{d}{s} (insecure={})", .{ mc.name, ws_host, ws_port, path, insecure_tls });
+    if (insecure_tls) rtd.debugLog("massive_rtd: [{s}] WARNING - TLS verification disabled", .{mc.name});
+    const client = try ws.Client.connect(gpa, ws_host, ws_port, path, bundle, .{
         .insecure_skip_verify = insecure_tls,
     });
     defer client.deinit();
 
-    // Publish the socket handle so onTerminate can interrupt the read.
-    self.active_sock.store(sockToUsize(client.stream.handle), .release);
-    defer self.active_sock.store(0, .release);
+    mc.active_sock.store(sockToUsize(client.stream.handle), .release);
+    defer mc.active_sock.store(0, .release);
 
     // Greet / auth handshake. Key is loaded fresh each session so rotating it
-    // on disk takes effect on the next reconnect — no XLL rebuild needed.
+    // on disk takes effect on the next reconnect - no XLL rebuild needed.
+    // Your access to a given market depends on what the API key's plan
+    // allows; if a market isn't authorized the server will reject auth.
     const api_key = config.loadApiKey(gpa) catch |err| {
-        rtd.debugLog("massive_rtd: could not load API key ({s}) — place massive_api_key.txt next to the XLL", .{@errorName(err)});
+        rtd.debugLog("massive_rtd: [{s}] could not load API key ({s}) - place massive_api_key.txt next to the XLL", .{ mc.name, @errorName(err) });
         return err;
     };
     defer gpa.free(api_key);
     try protocol.authenticate(client, gpa, api_key);
-    rtd.debugLog("massive_rtd: authenticated", .{});
-    self.authed.store(true, .release);
+    rtd.debugLog("massive_rtd: [{s}] authenticated", .{mc.name});
+    mc.authed.store(true, .release);
 
-    // 4) Replay any channels we already have (after a reconnect).
-    try flushInitialSubscribes(self, client);
+    // Replay any channels we already have (after a reconnect).
+    try flushInitialSubscribes(mc, client);
 
-    // 5) Read loop — poll for incoming messages AND flush pending sub/unsub.
-    while (self.running.load(.acquire)) {
-        // Flush sub/unsub queues.
-        try flushPending(self, client);
+    // Read loop - poll for incoming messages AND flush pending sub/unsub.
+    //
+    // We use a short poll timeout (readMessageTimeout) so that queued
+    // sub/unsub actions get flushed promptly even during off-hours when the
+    // server isn't pushing any frames. Without this, a fresh subscribe would
+    // sit in `pending_sub` until the next inbound frame, causing visible
+    // latency on low-traffic feeds. Every `ping_interval_ms` we also send a
+    // client-initiated WS ping to keep NAT happy and surface dead connections.
+    const poll_timeout_ms: i32 = 2000;
+    const ping_interval_ms: i64 = 20_000;
+    var last_ping_ms = std.time.milliTimestamp();
 
-        const msg = client.readMessage(gpa) catch |err| switch (err) {
+    while (mc.handler.running.load(.acquire)) {
+        try flushPending(mc, client);
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - last_ping_ms >= ping_interval_ms) {
+            client.sendPing("") catch |err| {
+                rtd.debugLog("massive_rtd: [{s}] ping failed: {s}", .{ mc.name, @errorName(err) });
+                return err;
+            };
+            last_ping_ms = now_ms;
+        }
+
+        const msg = client.readMessageTimeout(gpa, poll_timeout_ms) catch |err| switch (err) {
+            error.Timeout => continue,
             error.ConnectionClosed => return error.ConnectionClosed,
             else => return err,
         };
         defer gpa.free(msg.payload);
 
-        handleDataMessage(self, ctx, msg.payload) catch |err| {
-            rtd.debugLog("massive_rtd: handle error: {s}", .{@errorName(err)});
+        handleDataMessage(mc, msg.payload) catch |err| {
+            rtd.debugLog("massive_rtd: [{s}] handle error: {s}", .{ mc.name, @errorName(err) });
         };
     }
 }
 
-fn flushInitialSubscribes(self: *Handler, client: *ws.Client) !void {
+fn flushInitialSubscribes(mc: *MarketConn, client: *ws.Client) !void {
     // After a reconnect, re-subscribe to every channel we still care about.
     // Drain any queued subscribes first (they're redundant with channel_refs),
-    // but keep queued unsubscribes — they still need to be flushed next tick.
-    self.mu.lock();
+    // but keep queued unsubscribes - they still need to be flushed next tick.
+    mc.mu.lock();
     var channels: std.ArrayListUnmanaged([]const u8) = .empty;
     defer channels.deinit(gpa);
 
-    var it = self.channel_refs.iterator();
+    var it = mc.channel_refs.iterator();
     while (it.next()) |e| channels.append(gpa, e.key_ptr.*) catch {};
 
-    for (self.pending_sub.items) |s| gpa.free(s);
-    self.pending_sub.clearRetainingCapacity();
-    self.mu.unlock();
+    for (mc.pending_sub.items) |s| gpa.free(s);
+    mc.pending_sub.clearRetainingCapacity();
+    mc.mu.unlock();
 
     if (channels.items.len == 0) return;
-    rtd.debugLog("massive_rtd: re-subscribing {d} channels after reconnect", .{channels.items.len});
+    rtd.debugLog("massive_rtd: [{s}] re-subscribing {d} channels after reconnect", .{ mc.name, channels.items.len });
     try protocol.subscribe(client, gpa, channels.items);
 }
 
-fn flushPending(self: *Handler, client: *ws.Client) !void {
+fn flushPending(mc: *MarketConn, client: *ws.Client) !void {
     // Snapshot queued sub/unsub lists under the lock, release, then send.
     // Owns the moved-out strings so we free after sending.
-    self.mu.lock();
+    mc.mu.lock();
     var subs: std.ArrayListUnmanaged([]u8) = .empty;
     var unsubs: std.ArrayListUnmanaged([]u8) = .empty;
     defer subs.deinit(gpa);
     defer unsubs.deinit(gpa);
 
-    for (self.pending_sub.items) |s| subs.append(gpa, s) catch gpa.free(s);
-    self.pending_sub.clearRetainingCapacity();
+    for (mc.pending_sub.items) |s| subs.append(gpa, s) catch gpa.free(s);
+    mc.pending_sub.clearRetainingCapacity();
 
-    for (self.pending_unsub.items) |s| unsubs.append(gpa, s) catch gpa.free(s);
-    self.pending_unsub.clearRetainingCapacity();
-    self.mu.unlock();
+    for (mc.pending_unsub.items) |s| unsubs.append(gpa, s) catch gpa.free(s);
+    mc.pending_unsub.clearRetainingCapacity();
+    mc.mu.unlock();
 
     defer for (subs.items) |s| gpa.free(s);
     defer for (unsubs.items) |s| gpa.free(s);
@@ -381,17 +548,21 @@ fn flushPending(self: *Handler, client: *ws.Client) !void {
 // Incoming message dispatch
 // ============================================================================
 
-fn handleDataMessage(self: *Handler, ctx: *rtd.RtdContext, payload: []const u8) !void {
-    // Every data message is a JSON array of event objects.
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload, .{});
-    defer parsed.deinit();
+fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
+    // Every data message is a JSON array of event objects. Parse into the
+    // per-market frame arena; reset once at the top so we reuse pages.
+    _ = mc.frame_arena.reset(.retain_capacity);
+    const frame = mc.frame_arena.allocator();
 
-    const root = parsed.value;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, frame, payload, .{});
     if (root != .array) return error.NotAnArray;
 
+    const handler = mc.handler;
+    const ctx = handler.ctx orelse return;
+
     var any_dirty = false;
-    self.mu.lock();
-    defer self.mu.unlock();
+    handler.mu.lock();
+    defer handler.mu.unlock();
 
     for (root.array.items) |evt| {
         if (evt != .object) continue;
@@ -401,10 +572,10 @@ fn handleDataMessage(self: *Handler, ctx: *rtd.RtdContext, payload: []const u8) 
         if (ev_val != .string) continue;
         const ev = ev_val.string;
 
-        // Status messages ("ev":"status") aren't cell data — log and skip.
+        // Status messages ("ev":"status") aren't cell data - log and skip.
         if (std.mem.eql(u8, ev, "status")) {
             if (obj.get("message")) |m| {
-                if (m == .string) rtd.debugLog("massive_rtd: status: {s}", .{m.string});
+                if (m == .string) rtd.debugLog("massive_rtd: [{s}] status: {s}", .{ mc.name, m.string });
             }
             continue;
         }
@@ -414,23 +585,25 @@ fn handleDataMessage(self: *Handler, ctx: *rtd.RtdContext, payload: []const u8) 
         if (sym_val != .string) continue;
         const sym = sym_val.string;
 
-        // Scan all subscribed topics for ev+sym matches and update.
-        var it = self.topics.iterator();
+        // Scan subscribed topics. We filter by `market` to avoid cross-market
+        // aliasing if the same <ev>.<sym> happens to exist on two feeds - the
+        // flat `topics` map spans all markets.
+        var it = handler.topics.iterator();
         while (it.next()) |entry| {
             const state = entry.value_ptr;
+            if (!std.mem.eql(u8, state.market, mc.name)) continue;
             if (!std.mem.eql(u8, state.ev, ev)) continue;
             if (!std.mem.eql(u8, state.sym, sym)) continue;
 
             const field_name = if (state.field.len > 0) state.field else protocol.defaultFieldFor(ev);
             if (field_name.len == 0) {
-                // Serialize the whole object as a string.
-                const s = try std.json.Stringify.valueAlloc(gpa, evt, .{});
-                defer gpa.free(s);
+                // Serialize the whole object as a string (arena-scratch).
+                const s = try std.json.Stringify.valueAlloc(frame, evt, .{});
                 state.value.deinit(gpa);
                 state.value = try makeStringValue(s);
             } else if (obj.get(field_name)) |fv| {
                 state.value.deinit(gpa);
-                state.value = try valueFromJson(fv);
+                state.value = try valueFromJson(fv, frame);
             } else {
                 state.value.deinit(gpa);
                 state.value = .{ .err = @bitCast(@as(u32, 0x80020004)) }; // #N/A
@@ -447,7 +620,7 @@ fn handleDataMessage(self: *Handler, ctx: *rtd.RtdContext, payload: []const u8) 
     if (any_dirty) ctx.notifyExcel();
 }
 
-fn valueFromJson(v: std.json.Value) !OwnedValue {
+fn valueFromJson(v: std.json.Value, scratch: std.mem.Allocator) !OwnedValue {
     return switch (v) {
         .integer => |i| if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32))
             OwnedValue{ .int = @intCast(i) }
@@ -458,20 +631,14 @@ fn valueFromJson(v: std.json.Value) !OwnedValue {
         .bool => |b| .{ .boolean = b },
         .string => |s| try makeStringValue(s),
         .null => .{ .err = @bitCast(@as(u32, 0x80020004)) },
-        .array, .object => blk: {
-            const s = try std.json.Stringify.valueAlloc(gpa, v, .{});
-            defer gpa.free(s);
-            break :blk try makeStringValue(s);
-        },
+        .array, .object => try makeStringValue(try std.json.Stringify.valueAlloc(scratch, v, .{})),
     };
 }
 
 fn makeStringValue(utf8: []const u8) !OwnedValue {
-    // Convert UTF-8 to UTF-16 for the RTD layer.
-    const u16_buf = try gpa.alloc(u16, utf8.len);
-    errdefer gpa.free(u16_buf);
-    const written = try std.unicode.utf8ToUtf16Le(u16_buf, utf8);
-    return .{ .string = try gpa.realloc(u16_buf, written) };
+    // Convert UTF-8 to UTF-16 for the RTD layer. Lives beyond the frame arena,
+    // so allocate on the long-lived gpa.
+    return .{ .string = try std.unicode.utf8ToUtf16LeAlloc(gpa, utf8) };
 }
 
 // ============================================================================

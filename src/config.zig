@@ -1,5 +1,5 @@
 // API key loader. The key lives in the `MASSIVE_API_KEY` env var OR in
-// `massive_api_key.txt` on disk at runtime — no longer `@embedFile`'d.
+// `massive_api_key.txt` on disk at runtime - no longer `@embedFile`'d.
 // This lets a single XLL binary be shipped and users drop their key file
 // next to it (or set the env var, handy for CI / ephemeral shells).
 //
@@ -8,7 +8,7 @@
 //   2. Windows XLL: <dir containing the XLL>\massive_api_key.txt
 //      Native CLI:  ./massive_api_key.txt, then ./src/massive_api_key.txt
 //
-// The CLI's second path is for dev convenience — lets `zig build run-cli` work
+// The CLI's second path is for dev convenience - lets `zig build run-cli` work
 // from the repo root with the existing gitignored file under src/.
 
 const std = @import("std");
