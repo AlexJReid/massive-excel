@@ -20,7 +20,7 @@ In any cell:
 
 The optional second string picks the **market** — `stocks`, `options`, `forex`, `crypto`, `indices`, or `futures`. Omit it to use the default market baked into the build (see `-Dmassive_path`). The handler lazily opens a dedicated WebSocket for each market the workbook asks for, and keeps it alive for the session.
 
-**Your Massive plan decides which markets you can actually reach.** Subscribing to a market your API key isn't entitled to will fail auth; the RTD handler logs the status message and the affected cells show `#N/A`. See the [Massive pricing page](https://massive.com/pricing) for which plans include which markets.
+**Your Massive plan decides which markets you can actually reach.** Subscribing to a market your API key isn't entitled to will fail auth; the RTD handler logs the status message and the affected cells show `#N/A`. See the [Massive pricing page](https://massive.com/pricing) for which plans include which markets. You need a plan that supports websockets.
 
 Or use a convenience wrapper — `=MASSIVE(topic, [market])` takes the full topic string and optional market, and there's one per-event-type wrapper that takes `sym`, optional `field`, and optional `market`:
 
@@ -46,7 +46,7 @@ All wrappers delegate to the same RTD server, so subscription refcounting is sha
 - `<sym>` — ticker or pair (e.g. `AAPL`, `BTC-USD`)
 - `<field>` — any field name from the Massive message (e.g. `p`, `s`, `bp`, `ap`, `vw`, `c`, `h`, `l`, `o`, `v`). Omit for a sensible default per event type.
 
-**One subscription per channel.** If you have cells for both `T.AAPL.p` and `T.AAPL.s`, only **one** `T.AAPL` subscribe is sent to Massive. All cells update from the same event stream via refcounting.
+**One subscription per channel.** If you have cells for both `T.AAPL.p` and `T.AAPL.s`, only **one** `T.AAPL` subscribe is sent to Massive. All cells update from the same event stream via refcounting. Once all `T.AAPL.*` topics are removed, the unsubscribe is sent.
 
 ## Prerequisites
 
@@ -56,7 +56,7 @@ Zig 0.15.1 or later. Install via `brew install zig`, your package manager, or fr
 
 ### 2. Windows SDK (only needed to build the XLL)
 
-The XLL cross-compiles from mac/linux to Windows using [xwin](https://jake-shadle.github.io/xwin/) to fetch the MSVC headers and libs. Native Windows builds don't need this.
+The XLL cross-compiles from macOS/linux to Windows using [xwin](https://jake-shadle.github.io/xwin/) to fetch the MSVC headers and libs. Native Windows builds don't need this.
 
 **macOS:**
 ```bash
@@ -72,7 +72,7 @@ xwin --accept-license splat --output ~/.xwin
 
 ### 3. Massive API key
 
-Copy the example file and drop your key in:
+Setup your Massive account. Grab an API key. Copy the example file and drop your key in:
 
 ```bash
 cp src/massive_api_key.txt.example src/massive_api_key.txt
@@ -92,28 +92,31 @@ zig build              # XLL (zig-out/lib/standalone.xll) — cross-compiles to 
 zig build massive-cli  # native CLI smoke-tester (zig-out/bin/massive-cli)
 ```
 
-By default the XLL and CLI connect to `wss://delayed.massive.com` and use `/stocks` as the **default market** (15-minute delayed, usually free). A single build can talk to any market your API key allows — cells pick the market at runtime via the optional second RTD parameter. Override the host / default-market at build time:
+By default the XLL and CLI connect to `wss://delayed.massive.com` and use `/stocks` as the **default market** (15-minute delayed, usually free). A single build can talk to any market your API key allows — cells pick the market at runtime via the optional second RTD parameter.
 
-```bash
-zig build -Dmassive_host=socket.massive.com                              # real-time, default market still /stocks
-zig build -Dmassive_host=socket.massive.com -Dmassive_path=/crypto       # default market = /crypto
-zig build -Dmassive_host=business.massive.com                            # business tier cluster
-zig build -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true  # local mock
+Host / port / default path / TLS behaviour / API key are all configured at **runtime** via a `config.json` file dropped next to the XLL (or in `%APPDATA%\zigxll-massive\`). Same binary serves mock and prod; the config file decides. Example:
+
+```json
+{
+  "host": "socket.massive.com",
+  "port": 443,
+  "path": "/stocks",
+  "insecure": false,
+  "api_key": "pk_live_..."
+}
 ```
 
-Options:
-- `-Dmassive_host=<host>` — default `delayed.massive.com`
-- `-Dmassive_port=<port>` — default `443`
-- `-Dmassive_path=<path>` — default `/stocks`. Used as the default market when a topic doesn't specify one. The leading slash is stripped to derive the market name (`/stocks` → `stocks`).
-- `-Dmassive_insecure=true` — skip TLS cert verification (**local mock testing only**)
+See `src/config.json.example` for a template. All fields are optional — missing ones fall back to compile-time defaults. `$MASSIVE_API_KEY` in the environment overrides `api_key` if both are set.
 
-**Access is plan-dependent.** Massive sells market access per asset class; a given API key will only authenticate against markets your plan covers. A connection to a non-entitled market will fail auth — the affected cells show `#N/A`. Nothing in the XLL pre-validates this, so cells referencing unauthorized markets are effectively dead weight.
+The `-Dmassive_*` build flags still exist and set the **compile-time defaults** used when no config file is present, for reproducible CI builds. Most users should ignore them.
+
+**Access is plan-dependent.** Massive sells market access per asset class; a given API key will only authenticate against markets your plan covers. A connection to a non-entitled market will fail auth — the affected cells show `#N/A`.
 
 ## Run the XLL in Excel
 
 1. `zig build`
-2. Copy `zig-out/lib/standalone.xll` to your Windows box.
-3. Drop `massive_api_key.txt` (containing just your key) **in the same directory** as `standalone.xll`. The XLL loads it at connect time.
+2. Copy `zig-out/lib/massive_excel.xll` to your Windows box.
+3. Drop a `config.json` **in the same directory** as the XLL, containing at least `{"api_key":"pk_live_..."}`. See `src/config.json.example` for the full schema. Alternatively set `MASSIVE_API_KEY` in the environment before launching Excel.
 4. Unblock the file: right-click → Properties → check **Unblock** → OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
 5. Double-click the `.xll` to load it into Excel.
 6. In a cell: `=MASSIVE("T.AAPL.p")`.
@@ -133,7 +136,9 @@ Build a native binary that exercises the TLS client, WS framing, auth handshake,
 ```bash
 ./tools/gen_cert.sh      # generate self-signed TLS cert in tools/cert.pem + tools/key.pem
 npm install ws           # install Node WebSocket library
-echo 'test-key' > src/massive_api_key.txt   # the mock expects this key
+cat > src/config.json <<'EOF'
+{ "host": "localhost", "port": 8443, "insecure": true, "api_key": "test-key" }
+EOF
 ```
 
 **Run:**
@@ -142,15 +147,11 @@ echo 'test-key' > src/massive_api_key.txt   # the mock expects this key
 # terminal 1: start the mock Massive server
 node tools/mock_server.js
 
-# terminal 2: run the native CLI against it
-zig build run-cli \
-    -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true \
-    -- T.AAPL Q.MSFT AM.TSLA
+# terminal 2: run the native CLI against it (reads src/config.json)
+zig build run-cli -- T.AAPL Q.MSFT AM.TSLA
 
 # to exercise a non-default market path:
-zig build run-cli \
-    -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true \
-    -- --market crypto XT.BTC-USD
+zig build run-cli -- --market crypto XT.BTC-USD
 ```
 
 Expected output (on the CLI side):
@@ -172,35 +173,26 @@ Mock server environment variables:
 - `MOCK_API_KEY` — default `test-key`
 - `MOCK_TICK_MS` — default `500` (how often to emit fake events per subscribed channel)
 
-**Remember** to put your real key back in `src/massive_api_key.txt` before running the CLI against the real endpoint. (The XLL reads from its own directory, so its key file isn't affected by mock-server testing.)
+**Remember** to swap `src/config.json` back to your real key / endpoint before running the CLI against production. (The XLL reads its own `config.json` from the directory it's loaded from, so its config file isn't affected by mock-server testing.)
 
 ### Pointing the XLL itself at the mock server
 
-The same `-D` build options flow through to the XLL, so you can cross-compile a mock-targeting XLL and run it inside Excel. Useful when you want to exercise the RTD plumbing (`onConnect`, `onRefreshValue`, refcounts, multi-market pool) without hitting the real Massive endpoint.
+Same XLL binary now serves mock and prod — the config file decides. Use `./build-for-mock.sh`: it builds the XLL and writes a `config.json` next to it with `insecure: true`, `api_key: "test-key"`, and your LAN IP as the host.
 
 ```bash
-# from the repo root on mac/linux:
-zig build \
-    -Dmassive_host=<windows-box-view-of-mock> \
-    -Dmassive_port=8443 \
-    -Dmassive_insecure=true
+./build-for-mock.sh
+# outputs: zig-out/lib/massive_excel.xll + zig-out/lib/config.json
 ```
-
-What to use for `<windows-box-view-of-mock>`:
-- **Mock running on the same Windows box** (simplest): `localhost`.
-- **Mock on your mac/linux dev machine, XLL in a Windows VM**: use the host's hostname or IP as seen from inside the VM (e.g. VirtualBox: `10.0.2.2`; VMware: `host.docker.internal` or the bridged IP; Parallels: `10.211.55.2` or similar — check your VM's host-network config).
-- **Mock on another LAN host**: that host's IP or DNS name.
 
 Then on the Windows side:
 
-1. `cp zig-out/lib/standalone.xll` to the Windows box.
-2. Put `test-key` (the mock's expected key) in `massive_api_key.txt` next to the XLL — same directory as the `.xll`.
-3. Start the mock server somewhere reachable from the Windows box: `node tools/mock_server.js`.
-4. Make sure the mock's self-signed cert is what `tools/cert.pem` contains — the client is running with `insecure=true` so it won't verify, but the cert still has to be a valid TLS cert the server presents.
-5. Load the XLL in Excel, type `=MASSIVE("T.AAPL.p")`, confirm fake ticks arrive.
-6. Multi-market smoke test: `=MASSIVE("XT.BTC-USD.p","crypto")` + `=MASSIVE("T.AAPL.p","stocks")` in two cells should open two separate WebSocket connections (the mock accepts any path) and the debug log (OutputDebugString, visible in DebugView) will show `[stocks]` and `[crypto]` worker lines.
+1. Copy **both** `massive_excel.xll` and `config.json` from `zig-out/lib/` to the Windows box, into the **same directory**.
+2. Start the mock server somewhere reachable from the Windows box: `node tools/mock_server.js`.
+3. The mock's self-signed cert doesn't need to match any trust store — `insecure: true` in the config skips verification.
+4. Load the XLL in Excel, type `=MASSIVE("T.AAPL.p")`, confirm fake ticks arrive.
+5. Multi-market smoke test: `=MASSIVE("XT.BTC-USD.p","crypto")` + `=MASSIVE("T.AAPL.p","stocks")` in two cells should open two separate WebSocket connections (the mock accepts any path) and the debug log (OutputDebugString, visible in DebugView) will show `[stocks]` and `[crypto]` worker lines.
 
-**Critical safety reminder:** `-Dmassive_insecure=true` skips TLS cert verification for **every** connection that XLL makes, including any real endpoint. A mock-targeting XLL must never be used against production data. Keep mock builds in a separate directory from production builds, and consider renaming the artifact (e.g. `standalone-mock.xll`) so you can tell them apart.
+**Critical:** `insecure: true` skips TLS cert verification for **every** connection the XLL makes, including any real endpoint. Keep mock and prod installs in separate directories — the _config file_, not the binary, is the thing that must never sit next to a production endpoint.
 
 ## Architecture
 
@@ -213,7 +205,7 @@ Then on the Windows side:
             │        ,"T.AAPL.p","stocks")             │
             │    │                                     │
             │    ▼                                     │
-            │  xlfRtd ─────────► COM RTD server        │  (standalone.xll)
+            │  xlfRtd ─────────► COM RTD server        │  (massive_excel.xll)
             │                       │                  │
             └───────────────────────┼──────────────────┘
                                     │ onConnect / onRefreshValue
@@ -260,4 +252,3 @@ Key source files:
 - **Sub/unsub latency between market hours.** Each worker uses a 2s `poll`-gated read (`readMessageTimeout`) so queued sub/unsub actions flush on the next tick even when the server is idle. It also sends a client-initiated WS ping every 20s to keep NAT mappings warm. Intraday latency is sub-second; worst-case off-hours latency is the poll interval.
 - **64 KiB single-frame cap.** Fragmented or huge frames will error. Safe for the Massive wire format (messages are small).
 - **Reconnect.** On drop, the worker reconnects with a fixed 2s backoff forever, re-authenticates, and re-subscribes to all currently-live channels.
-- **TLS truncation attacks.** `allow_truncation_attacks` is enabled on the TLS client, which is fine for WebSocket framing (frame headers carry the length). Don't copy this setup for HTTP-with-no-content-length.

@@ -2,6 +2,8 @@
 zig-out
 .zig-cache
 src/massive_api_key.txt
+src/config.json
+config.json
 node_modules
 package-lock.json
 tools/cert.pem

@@ -29,20 +29,56 @@ zig build massive-cli              # native CLI → zig-out/bin/massive-cli
 zig build run-cli -- T.AAPL T.MSFT # build + run CLI (pass channels as trailing args)
 ```
 
-Build options (flow through to both the XLL and the CLI via an `Options` module):
+The `-D` build options still exist but now act as **compile-time defaults**
+for fields that `config.json` doesn't override. An unconfigured install will
+still build and run against whatever host was baked in. Most users should
+ignore the flags and configure via `config.json` at runtime.
 
 ```bash
 zig build -Dmassive_host=<host>        # default: delayed.massive.com
           -Dmassive_port=<port>        # default: 443
-          -Dmassive_path=<path>        # default: /stocks (interpreted as "default market")
-          -Dmassive_insecure=true      # skip TLS verification (LOCAL MOCK ONLY)
+          -Dmassive_path=<path>        # default: /stocks
+          -Dmassive_insecure=true      # default: false
 ```
 
-`massive_path` is now interpreted as the **default market** - `/stocks` means
+`massive_path` is interpreted as the **default market** — `/stocks` means
 "if the user's topic doesn't name a market, route it to the stocks feed".
 Each market the workbook actually subscribes to gets its own connection
-regardless of what this option is set to; it only decides the default for
-unqualified topics.
+regardless; this only decides the default for unqualified topics.
+
+## Runtime config (`config.json`)
+
+Host, port, default path, `insecure`, and `api_key` are loaded at startup
+from a JSON file. Search order:
+
+- **Windows XLL:** `<dir containing the XLL>\config.json`, then
+  `%APPDATA%\zigxll-massive\config.json`
+- **Native CLI:** `./config.json`, then `./src/config.json`
+
+Schema (all fields optional — missing ones fall back to `-D` build defaults):
+
+```json
+{
+  "host": "delayed.massive.com",
+  "port": 443,
+  "path": "/stocks",
+  "insecure": false,
+  "api_key": "pk_live_..."
+}
+```
+
+**API key precedence:** `$MASSIVE_API_KEY` env var wins over the JSON file.
+If neither is set, the RTD worker logs `no API key configured` and the
+`init()` pre-flight surfaces a dialog so the user sees the problem on load.
+
+**The config is cached for the life of the process.** Rotating the key now
+requires an Excel restart — previously each reconnect re-read
+`massive_api_key.txt` from disk. If live key rotation is needed, clear
+`cached` in `src/config.zig` on a signal of your choosing.
+
+**`insecure: true` footgun:** disables TLS verification for **every**
+connection, including accidental hits against a real endpoint. `onStart`
+logs a loud warning when this is set.
 
 ## Code layout
 
@@ -78,15 +114,15 @@ unqualified topics.
 - `src/ca_bundle.pem` — Mozilla CA roots from curl.se. Checked in for
   reproducible builds. Regenerate with `curl -sS -L -o src/ca_bundle.pem https://curl.se/ca/cacert.pem`.
 
-- `src/config.zig` — runtime loader for the Massive API key. Checks
-  `$MASSIVE_API_KEY` first, then falls back to `massive_api_key.txt`: the XLL
-  reads it from the directory containing the `.xll` file (via
-  `GetModuleFileNameA`); the native CLI reads from `./massive_api_key.txt`
-  then `./src/massive_api_key.txt`. Key is re-loaded on every reconnect, so
-  rotating it takes effect without a rebuild.
+- `src/config.zig` — runtime config loader. Parses `config.json` via Win32
+  `CreateFileA`/`ReadFile` (std.fs is unreliable in cross-compiled XLL
+  context). Exposes `config.load()` which returns a `*const Config` cached
+  for the life of the process. Lifts the pattern from
+  `../zigxll-nats/src/config.zig`.
 
-- `src/massive_api_key.txt` — gitignored. Deployed alongside the XLL at runtime;
-  NOT `@embedFile`'d. There's a `.example` file in the repo.
+- `src/config.json` — gitignored. Deployed alongside the XLL at runtime.
+  Schema in the "Runtime config" section above; example at
+  `src/config.json.example`.
 
 - `build.zig` — declares Windows XLL (cross-compiled MSVC) and native CLI as
   separate compile units. Build options are plumbed through a single `Options`
@@ -266,18 +302,19 @@ a very good reason.
 
 - Build clean: `zig build && zig build massive-cli`
 - Smoke test: `./tools/gen_cert.sh && npm install ws && node tools/mock_server.js &`
-  then `zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true -- T.AAPL T.MSFT`
-- **The mock expects API key `test-key`**. Put the real key back in
-  `src/massive_api_key.txt` (the CLI reads from there) before testing
-  against the real endpoint. No rebuild required - the key is loaded at
-  runtime on every reconnect.
-- Mock-targeting XLL: the same `-D` flags work on `zig build` (the XLL target),
-  not just `run-cli`. Example for a Windows VM pointing at a mac-hosted mock:
-  `zig build -Dmassive_host=10.0.2.2 -Dmassive_port=8443 -Dmassive_insecure=true`.
-  Ship the resulting `.xll` + `massive_api_key.txt` (containing `test-key`) to
-  the Windows box. **Keep mock XLLs in a separate directory from production
-  builds** - `-Dmassive_insecure=true` disables TLS verification for every
-  connection the XLL makes, so a mock build must never see real endpoints.
+  then write a `src/config.json` with
+  `{"host":"localhost","port":8443,"insecure":true,"api_key":"test-key"}`
+  and run `zig build run-cli -- T.AAPL T.MSFT`.
+- **The mock expects API key `test-key`**. Swap `src/config.json` (or set
+  `$MASSIVE_API_KEY`) when pointing at a real endpoint — the config is read
+  once per process so an Excel restart / CLI re-run is required.
+- Mock-targeting XLL: same binary serves mock and prod now. Use
+  `./build-for-mock.sh`, which builds the XLL and writes a mock
+  `config.json` next to it. Ship both files to the Windows box. **Still
+  keep mock and prod installs in separate directories** — the config file's
+  `insecure: true` flag disables TLS verification for every connection, so
+  a mock `config.json` must never sit next to a build that might see a real
+  endpoint.
 - There's no `zig build test` target in this repo - the framework has its own.
   You can add `test` blocks to files under `src/`; run them via
   `zig test src/massive_protocol.zig` directly (it has a small topic-parsing test).

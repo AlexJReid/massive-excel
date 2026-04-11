@@ -15,25 +15,18 @@ pub const rtd_servers = .{
 /// Called by the framework during xlAutoOpen, after function/RTD registration.
 /// We use it to pre-validate the Massive API key and, on failure, surface a
 /// dialog so users immediately see what's wrong. Returning success means the
-/// XLL still loads - the RTD worker will keep retrying on every reconnect, so
-/// dropping `massive_api_key.txt` in place (or setting `$MASSIVE_API_KEY`)
-/// recovers without an Excel restart.
+/// XLL still loads - the RTD worker re-reads the cached config on every
+/// connect attempt, so fixing the config and restarting Excel recovers.
 pub fn init() !void {
-    const key = config.loadApiKey(std.heap.c_allocator) catch |err| {
-        const msg = std.fmt.allocPrint(
-            std.heap.c_allocator,
-            "Massive API key not found ({s}).\n\n" ++
-                "Place a file named 'massive_api_key.txt' containing your key " ++
-                "in the same directory as standalone.xll, or set the " ++
-                "MASSIVE_API_KEY environment variable.\n\n" ++
-                "The XLL will keep retrying - no restart needed once the key is in place.",
-            .{@errorName(err)},
-        ) catch return;
-        defer std.heap.c_allocator.free(msg);
+    const cfg = config.load();
+    if (cfg.api_key == null) {
+        const msg =
+            "Massive API key not configured.\n\n" ++
+            "Set MASSIVE_API_KEY in the environment, or add an \"api_key\" " ++
+            "field to a config.json file in the same directory as the XLL " ++
+            "(or in %APPDATA%\\zigxll-massive\\config.json).";
         showAlert(msg);
-        return;
-    };
-    std.heap.c_allocator.free(key);
+    }
 }
 
 fn showAlert(text: []const u8) void {

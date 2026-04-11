@@ -1,7 +1,7 @@
 .{
-    .name = .zigxll_massive,
+    .name = .massive_excel,
     .version = "0.0.5",
-    .fingerprint = 0x68ae5e05e02c9113,
+    .fingerprint = 0xd80d17825b3de4b4,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .xll = .{

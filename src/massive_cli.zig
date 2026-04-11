@@ -8,20 +8,16 @@
 // Usage:
 //   zig build run-cli -- T.AAPL T.MSFT
 //   zig build run-cli -- --market crypto XT.BTC-USD
-//   zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecure=true -- T.AAPL
 //
-// The `--market <name>` flag picks the WebSocket path (/stocks, /crypto,
-// /forex, /options, /indices, /futures). Without it we use the default path
-// from the -Dmassive_path build option.
-//
-// The API key is loaded at runtime from ./massive_api_key.txt (or ./src/massive_api_key.txt
-// for dev convenience when running via `zig build run-cli` from the repo root).
+// Host/port/default path/insecure flag all come from config.json (searched
+// in ./config.json then ./src/config.json), falling back to the -Dmassive_*
+// build defaults. The `--market <name>` flag overrides the configured path.
+// The API key comes from $MASSIVE_API_KEY or config.json's `api_key` field.
 
 const std = @import("std");
 const ws = @import("ws_client.zig");
 const protocol = @import("massive_protocol.zig");
 const config = @import("config.zig");
-const opts = @import("massive_options");
 
 const ca_bundle_pem = @embedFile("ca_bundle.pem");
 
@@ -33,8 +29,10 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
+    const cfg = config.load();
+
     // Parse args: optional "--market <name>" then positional channel list.
-    var path: []const u8 = opts.massive_path;
+    var path: []const u8 = cfg.path;
     var arg_i: usize = 1;
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--market")) {
         const market = args[2];
@@ -55,13 +53,8 @@ pub fn main() !void {
     const channels = args[arg_i..];
 
     const log = std.log.scoped(.massive_cli);
-    log.info("host={s} port={d} path={s} insecure={}", .{
-        opts.massive_host,
-        opts.massive_port,
-        path,
-        opts.massive_insecure,
-    });
-    if (opts.massive_insecure) log.warn("TLS verification disabled", .{});
+    log.info("host={s} port={d} path={s} insecure={}", .{ cfg.host, cfg.port, path, cfg.insecure });
+    if (cfg.insecure) log.warn("TLS verification disabled — never use against a real endpoint", .{});
 
     var bundle = try ws.loadCaBundleFromPem(alloc, ca_bundle_pem);
     defer bundle.deinit(alloc);
@@ -69,17 +62,19 @@ pub fn main() !void {
     log.info("connecting...", .{});
     const client = try ws.Client.connect(
         alloc,
-        opts.massive_host,
-        opts.massive_port,
+        cfg.host,
+        cfg.port,
         path,
         bundle,
-        .{ .insecure_skip_verify = opts.massive_insecure },
+        .{ .insecure_skip_verify = cfg.insecure },
     );
     defer client.deinit();
     log.info("connected", .{});
 
-    const api_key = try config.loadApiKey(alloc);
-    defer alloc.free(api_key);
+    const api_key = cfg.api_key orelse {
+        log.err("no API key configured — set MASSIVE_API_KEY or add api_key to config.json", .{});
+        std.process.exit(1);
+    };
     try protocol.authenticate(client, alloc, api_key);
     log.info("authenticated", .{});
 

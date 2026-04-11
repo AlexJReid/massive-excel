@@ -35,19 +35,17 @@ pub fn build(b: *std.Build) void {
 
     const xll_build = @import("xll");
     const xll = xll_build.buildXll(b, .{
-        .name = "standalone",
+        .name = "massive_excel",
         .user_module = user_module,
         .target = win_target,
         .optimize = optimize,
     });
 
-    const install_xll = b.addInstallFile(xll.getEmittedBin(), "lib/standalone.xll");
+    const install_xll = b.addInstallFile(xll.getEmittedBin(), "lib/massive_excel.xll");
     b.getInstallStep().dependOn(&install_xll.step);
 
     // ------------------------------------------------------------------
-    // Native CLI — smoke-test the WS client + Massive protocol on
-    // whatever host you're developing on (mac/linux/windows).
-    // Entry: src/massive_cli.zig.
+    // Native CLI — smoke-test the WS client + Massive protocol
     // ------------------------------------------------------------------
     const native_target = b.standardTargetOptions(.{});
     const cli = b.addExecutable(.{

@@ -40,32 +40,13 @@ const xll = @import("xll");
 const rtd = xll.rtd;
 const ws = @import("ws_client.zig");
 const protocol = @import("massive_protocol.zig");
-const opts = @import("massive_options");
+const config = @import("config.zig");
 
 const gpa = std.heap.c_allocator;
-
-// ============================================================================
-// Configuration (from build options - see build.zig)
-// ============================================================================
-
-const ws_host = opts.massive_host;
-const ws_port: u16 = opts.massive_port;
-const insecure_tls = opts.massive_insecure;
-
-/// Default market used when a topic omits the market parameter. Derived from
-/// the legacy `massive_path` build option (e.g. "/stocks" -> "stocks") so
-/// existing users keep their implicit stocks feed.
-const default_market: []const u8 = blk: {
-    const p = opts.massive_path;
-    if (p.len > 0 and p[0] == '/') break :blk p[1..];
-    break :blk p;
-};
 
 /// CA trust bundle. Fetched once from https://curl.se/ca/cacert.pem and
 /// checked into the repo for reproducible builds.
 const ca_bundle_pem = @embedFile("ca_bundle.pem");
-
-const config = @import("config.zig");
 
 // ============================================================================
 // Value state
@@ -194,7 +175,11 @@ const Handler = struct {
     markets: std.StringHashMapUnmanaged(*MarketConn) = .empty,
 
     pub fn onStart(self: *Handler, ctx: *rtd.RtdContext) void {
-        rtd.debugLog("massive_rtd: onStart (default_market={s})", .{default_market});
+        const cfg = config.load();
+        rtd.debugLog("massive_rtd: onStart host={s} port={d} insecure={} default_market={s}", .{
+            cfg.host, cfg.port, cfg.insecure, cfg.defaultMarket(),
+        });
+        if (cfg.insecure) rtd.debugLog("massive_rtd: WARNING - TLS verification disabled for ALL connections", .{});
         self.ctx = ctx;
         self.running.store(true, .release);
         // Workers are spawned lazily when the first topic for a given market
@@ -210,7 +195,7 @@ const Handler = struct {
         const market_str = if (entry.strings.len >= 2 and entry.strings[1].len > 0)
             entry.strings[1]
         else
-            default_market;
+            config.load().defaultMarket();
 
         _ = protocol.parseTopic(topic_str) catch |err| {
             rtd.debugLog("massive_rtd: bad topic '{s}': {s}", .{ topic_str, @errorName(err) });
@@ -431,22 +416,21 @@ fn workerSession(mc: *MarketConn) !void {
     var path_buf: [32]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/{s}", .{mc.name});
 
-    rtd.debugLog("massive_rtd: [{s}] connecting to {s}:{d}{s} (insecure={})", .{ mc.name, ws_host, ws_port, path, insecure_tls });
-    if (insecure_tls) rtd.debugLog("massive_rtd: [{s}] WARNING - TLS verification disabled", .{mc.name});
-    const client = try ws.Client.connect(gpa, ws_host, ws_port, path, bundle, .{
-        .insecure_skip_verify = insecure_tls,
+    const cfg = config.load();
+    rtd.debugLog("massive_rtd: [{s}] connecting to {s}:{d}{s} (insecure={})", .{ mc.name, cfg.host, cfg.port, path, cfg.insecure });
+    const client = try ws.Client.connect(gpa, cfg.host, cfg.port, path, bundle, .{
+        .insecure_skip_verify = cfg.insecure,
     });
     defer client.deinit();
 
-    // Greet / auth handshake. Key is loaded fresh each session so rotating it
-    // on disk takes effect on the next reconnect - no XLL rebuild needed.
-    // Your access to a given market depends on what the API key's plan
-    // allows; if a market isn't authorized the server will reject auth.
-    const api_key = config.loadApiKey(gpa) catch |err| {
-        rtd.debugLog("massive_rtd: [{s}] could not load API key ({s}) - place massive_api_key.txt next to the XLL", .{ mc.name, @errorName(err) });
-        return err;
+    // Auth handshake. The config is cached for the life of the process — to
+    // rotate keys, update $MASSIVE_API_KEY or config.json and restart Excel.
+    // Access to a given market is gated by the API key's plan; unauthorized
+    // markets fail auth.
+    const api_key = cfg.api_key orelse {
+        rtd.debugLog("massive_rtd: [{s}] no API key configured - set MASSIVE_API_KEY or add api_key to config.json", .{mc.name});
+        return error.NoApiKey;
     };
-    defer gpa.free(api_key);
     try protocol.authenticate(client, gpa, api_key);
     rtd.debugLog("massive_rtd: [{s}] authenticated", .{mc.name});
     mc.authed.store(true, .release);
