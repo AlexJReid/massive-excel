@@ -2,6 +2,5 @@
   "host": "delayed.massive.com",
   "port": 443,
   "path": "/stocks",
-  "insecure": false,
   "api_key": "paste-your-massive-api-key-here"
 }

@@ -10,11 +10,11 @@ const ParamMeta = xll.ParamMeta;
 // build (see -Dmassive_path).
 pub const massive = ExcelFunction(.{
     .name = "MASSIVE",
-    .description = "Subscribe to a Massive WebSocket topic (e.g. T.AAPL.p)",
+    .description = "Subscribe to a Massive WebSocket topic (e.g. T.AAPL.p). Fields: p=price, s=size/start-ts, t=ts, bp/ap=bid/ask, o/h/l/c=OHLC, v=vol, a=VWAP, e=end-ts. See massive.com/docs/websocket/quickstart",
     .category = "Massive",
     .thread_safe = false,
     .params = &[_]ParamMeta{
-        .{ .name = "topic", .description = "Topic string, e.g. T.AAPL.p or Q.MSFT.bp" },
+        .{ .name = "topic", .description = "<ev>.<sym>[.<field>] e.g. T.AAPL.p, Q.MSFT.bp, AM.TSLA.a" },
         .{ .name = "market", .description = "Optional market: stocks, options, forex, crypto, indices, futures" },
     },
     .func = massiveFunc,
@@ -38,7 +38,7 @@ pub const massive_trade = ExcelFunction(.{
     .thread_safe = false,
     .params = &[_]ParamMeta{
         .{ .name = "sym", .description = "Ticker, e.g. AAPL" },
-        .{ .name = "field", .description = "Optional field (p, s, ...); default p" },
+        .{ .name = "field", .description = "p=price, s=size, t=ts, x=exchange; default p" },
         .{ .name = "market", .description = "Optional market; default from build" },
     },
     .func = massiveTradeFunc,
@@ -55,7 +55,7 @@ pub const massive_quote = ExcelFunction(.{
     .thread_safe = false,
     .params = &[_]ParamMeta{
         .{ .name = "sym", .description = "Ticker, e.g. AAPL" },
-        .{ .name = "field", .description = "Optional field (bp, ap, ...); default ap" },
+        .{ .name = "field", .description = "bp/ap=bid/ask price, bs/as=sizes; default ap" },
         .{ .name = "market", .description = "Optional market; default from build" },
     },
     .func = massiveQuoteFunc,
@@ -65,37 +65,37 @@ fn massiveQuoteFunc(sym: []const u8, field: ?[]const u8, market: ?[]const u8) !*
     return subscribeEvent("Q", sym, field, market);
 }
 
-pub const massive_agg_min = ExcelFunction(.{
-    .name = "MASSIVE.AGG_MIN",
-    .description = "Subscribe to Massive per-minute aggregates (AM.<sym>[.<field>])",
+pub const massive_agg_minute = ExcelFunction(.{
+    .name = "MASSIVE.AGG_MINUTE",
+    .description = "Subscribe to Massive minute aggregate bars (AM.<sym>[.<field>])",
     .category = "Massive",
     .thread_safe = false,
     .params = &[_]ParamMeta{
         .{ .name = "sym", .description = "Ticker, e.g. AAPL" },
-        .{ .name = "field", .description = "Optional field (o, h, l, c, v, vw); default c" },
+        .{ .name = "field", .description = "o/h/l/c=OHLC, v=volume, a=VWAP, s/e=start/end-ts; default c" },
         .{ .name = "market", .description = "Optional market; default from build" },
     },
-    .func = massiveAggMinFunc,
+    .func = massiveAggMinuteFunc,
 });
 
-fn massiveAggMinFunc(sym: []const u8, field: ?[]const u8, market: ?[]const u8) !*xll.xl.XLOPER12 {
+fn massiveAggMinuteFunc(sym: []const u8, field: ?[]const u8, market: ?[]const u8) !*xll.xl.XLOPER12 {
     return subscribeEvent("AM", sym, field, market);
 }
 
-pub const massive_agg_sec = ExcelFunction(.{
-    .name = "MASSIVE.AGG_SEC",
-    .description = "Subscribe to Massive per-second aggregates (A.<sym>[.<field>])",
+pub const massive_agg_second = ExcelFunction(.{
+    .name = "MASSIVE.AGG_SECOND",
+    .description = "Subscribe to Massive second aggregate bars (A.<sym>[.<field>])",
     .category = "Massive",
     .thread_safe = false,
     .params = &[_]ParamMeta{
         .{ .name = "sym", .description = "Ticker, e.g. AAPL" },
-        .{ .name = "field", .description = "Optional field (o, h, l, c, v, vw); default c" },
+        .{ .name = "field", .description = "o/h/l/c=OHLC, v=volume, a=VWAP, s/e=start/end-ts; default c" },
         .{ .name = "market", .description = "Optional market; default from build" },
     },
-    .func = massiveAggSecFunc,
+    .func = massiveAggSecondFunc,
 });
 
-fn massiveAggSecFunc(sym: []const u8, field: ?[]const u8, market: ?[]const u8) !*xll.xl.XLOPER12 {
+fn massiveAggSecondFunc(sym: []const u8, field: ?[]const u8, market: ?[]const u8) !*xll.xl.XLOPER12 {
     return subscribeEvent("A", sym, field, market);
 }
 

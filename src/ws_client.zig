@@ -57,6 +57,11 @@ pub const Client = struct {
     tls_write_buf: []u8,
 
     closed: bool = false,
+    /// Unix-ms timestamp of the most recent inbound frame (any opcode: text,
+    /// binary, pong, ping, close). Updated inside `readRawFrame`. Callers
+    /// that send periodic pings should watch this field to detect a stalled
+    /// connection earlier than the OS keepalive (which can take minutes).
+    last_recv_ms: i64 = 0,
 
     pub const Options = struct {
         /// If true, TLS cert chain is NOT verified. Only enable for local
@@ -126,6 +131,7 @@ pub const Client = struct {
         );
 
         try self.performUpgrade(host, path);
+        self.last_recv_ms = std.time.milliTimestamp();
 
         return self;
     }
@@ -387,6 +393,7 @@ pub const Client = struct {
         }
 
         const opcode: Opcode = std.meta.intToEnum(Opcode, opcode_raw) catch return error.InvalidOpcode;
+        self.last_recv_ms = std.time.milliTimestamp();
         return .{ .opcode = opcode, .payload = payload };
     }
 };

@@ -97,10 +97,6 @@ const TopicState = struct {
     market: []const u8,
     /// Last known value for this cell.
     value: OwnedValue = .{ .err = @bitCast(@as(u32, 0x80020004)) }, // #N/A
-
-    fn channel(self: *const TopicState) []const u8 {
-        return self.topic[0..self.channel_len];
-    }
 };
 
 // ============================================================================
@@ -118,14 +114,35 @@ const MarketConn = struct {
     /// dispatch into the topics map and Excel notification.
     handler: *Handler,
 
-    // --- Background thread state (written by Handler, read by worker) ---
+    // --- Worker-thread-only state (not touched by Handler callbacks) ---
     worker_thread: ?std.Thread = null,
-    authed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Did the most recent session reach the read loop? Checked at the top of
+    /// the worker loop to decide whether to reset `reconnect_attempts`.
+    session_was_authed: bool = false,
+    /// Consecutive failed sessions since the last successful auth. Feeds the
+    /// reconnect backoff.
+    reconnect_attempts: u32 = 0,
+    /// PRNG for jittering the reconnect delay. Seeded once in workerMain
+    /// before the loop runs.
+    jitter_rng: std.Random.DefaultPrng = undefined,
+    /// Exponentially-weighted moving average of per-frame dispatch time, in
+    /// milliseconds. Used to detect "dispatch is falling behind" without
+    /// spamming the log on a single slow frame. Updated at the bottom of
+    /// handleDataMessage, worker-thread-only.
+    dispatch_ewma_ms: u64 = 0,
+    /// Unix-ms timestamp of the last "dispatch lagging" warning we logged.
+    /// Rate-limits the warning to at most once per 10s per market.
+    last_lag_warn_ms: i64 = 0,
 
     // --- Protected by `mu` ---
     mu: std.Thread.Mutex = .{},
-    /// Channel -> refcount. The key is owned by this map (independent alloc).
-    channel_refs: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Channel -> list of topic_ids subscribed to that channel. The list is
+    /// both the dispatch index (read on each frame to route an incoming
+    /// "<ev>.<sym>" to the cells that care) and the refcount (number of live
+    /// subscriptions for the channel *is* `list.items.len`). When the list
+    /// empties we remove the entry and queue an unsubscribe. Keys are owned
+    /// by this map.
+    channels: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(rtd.LONG)) = .empty,
     /// Queued subscribe/unsubscribe actions for the worker thread to flush.
     /// Strings in these lists are owned - the worker frees them after flushing.
     pending_sub: std.ArrayListUnmanaged([]u8) = .empty,
@@ -137,10 +154,12 @@ const MarketConn = struct {
     frame_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator),
 
     fn deinit(self: *MarketConn) void {
-        // Free channel_refs keys.
-        var cit = self.channel_refs.iterator();
-        while (cit.next()) |e| gpa.free(e.key_ptr.*);
-        self.channel_refs.deinit(gpa);
+        var ch_it = self.channels.iterator();
+        while (ch_it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            e.value_ptr.deinit(gpa);
+        }
+        self.channels.deinit(gpa);
 
         for (self.pending_sub.items) |s| gpa.free(s);
         self.pending_sub.deinit(gpa);
@@ -231,23 +250,31 @@ const Handler = struct {
             return;
         };
 
-        // Bump channel refcount on the market connection. The refcount map is
-        // protected by mc.mu, NOT Handler.mu, so we lock it for this section.
+        // Append this topic_id to the channel's subscriber list. The list
+        // doubles as the refcount (len == refcount) and as the dispatch index.
+        // When a channel appears for the first time we also queue a subscribe.
         const channel = owned_topic[0..owned.channel_len];
         mc.mu.lock();
         defer mc.mu.unlock();
 
-        if (mc.channel_refs.getEntry(channel)) |ref| {
-            ref.value_ptr.* += 1;
-        } else {
-            const owned_channel = gpa.dupe(u8, channel) catch return;
-            mc.channel_refs.put(gpa, owned_channel, 1) catch {
-                gpa.free(owned_channel);
-                return;
-            };
-            const queued = gpa.dupe(u8, channel) catch return;
-            mc.pending_sub.append(gpa, queued) catch gpa.free(queued);
+        if (mc.channels.getEntry(channel)) |existing| {
+            existing.value_ptr.append(gpa, topic_id) catch {};
+            return;
         }
+
+        const owned_channel = gpa.dupe(u8, channel) catch return;
+        var list: std.ArrayListUnmanaged(rtd.LONG) = .empty;
+        list.append(gpa, topic_id) catch {
+            gpa.free(owned_channel);
+            return;
+        };
+        mc.channels.put(gpa, owned_channel, list) catch {
+            list.deinit(gpa);
+            gpa.free(owned_channel);
+            return;
+        };
+        const queued = gpa.dupe(u8, channel) catch return;
+        mc.pending_sub.append(gpa, queued) catch gpa.free(queued);
     }
 
     pub fn onConnectBatch(_: *Handler, _: *rtd.RtdContext, _: []const rtd.LONG) void {
@@ -266,12 +293,25 @@ const Handler = struct {
             mc.mu.lock();
             defer mc.mu.unlock();
 
-            if (mc.channel_refs.getEntry(channel)) |ref| {
-                if (ref.value_ptr.* > 1) {
-                    ref.value_ptr.* -= 1;
-                } else {
-                    const owned_key = @constCast(ref.key_ptr.*);
-                    _ = mc.channel_refs.remove(channel);
+            // Remove this topic_id from the channel's subscriber list. Linear
+            // scan is fine: a single channel rarely has more than a handful of
+            // cells pointing at it (typically one per field suffix: .p, .s).
+            // When the list empties, the channel has no live subscriptions -
+            // drop it and queue an unsubscribe. The owned key is handed off
+            // to pending_unsub so we don't double-free.
+            if (mc.channels.getEntry(channel)) |entry| {
+                const list = entry.value_ptr;
+                var i: usize = 0;
+                while (i < list.items.len) : (i += 1) {
+                    if (list.items[i] == topic_id) {
+                        _ = list.swapRemove(i);
+                        break;
+                    }
+                }
+                if (list.items.len == 0) {
+                    const owned_key = @constCast(entry.key_ptr.*);
+                    list.deinit(gpa);
+                    _ = mc.channels.remove(channel);
                     mc.pending_unsub.append(gpa, owned_key) catch gpa.free(owned_key);
                 }
             }
@@ -391,20 +431,81 @@ fn isKnownMarket(name: []const u8) bool {
 fn workerMain(mc: *MarketConn) void {
     rtd.debugLog("massive_rtd: [{s}] worker starting", .{mc.name});
 
+    // Seed the jitter RNG once. `milliTimestamp` as seed is fine - we only
+    // need the different workers / processes to diverge slightly to avoid
+    // synchronized reconnects.
+    mc.jitter_rng = std.Random.DefaultPrng.init(@bitCast(std.time.milliTimestamp()));
+
     while (mc.handler.running.load(.acquire)) {
+        // If the *previous* session reached the read loop, the error that
+        // ended it was a mid-stream drop - not a systemic auth/plan/key
+        // problem. Reset the backoff so the user sees a fast recovery.
+        if (mc.session_was_authed) {
+            mc.reconnect_attempts = 0;
+            mc.session_was_authed = false;
+        }
+
+        var terminal = false;
         workerSession(mc) catch |err| {
             rtd.debugLog("massive_rtd: [{s}] session error: {s}", .{ mc.name, @errorName(err) });
+            // Terminal errors: no point retrying. Missing key won't appear,
+            // bad key won't become good, and a plan that doesn't cover this
+            // market won't start covering it mid-session. Exit the worker so
+            // we don't hammer the endpoint with a doomed reconnect loop.
+            // Cells for this market stay #N/A; the user sees the cause in
+            // the debug log (and, for missing key at startup, in the dialog
+            // popped by init() in main.zig).
+            terminal = switch (err) {
+                error.NoApiKey, error.AuthFailed => true,
+                else => false,
+            };
         };
-        mc.authed.store(false, .release);
+        if (terminal) {
+            rtd.debugLog("massive_rtd: [{s}] terminal auth error - worker exiting, cells will stay #N/A until Excel restart", .{mc.name});
+            return;
+        }
 
-        // Backoff before reconnect.
+        if (!mc.handler.running.load(.acquire)) break;
+
+        mc.reconnect_attempts += 1;
+        const delay_ms = nextBackoffMs(mc);
+        rtd.debugLog("massive_rtd: [{s}] reconnecting in {d}ms (attempt {d})", .{ mc.name, delay_ms, mc.reconnect_attempts });
+
+        // Sleep in 100ms slices so teardown still wakes us within ~100ms.
         var slept_ms: u64 = 0;
-        while (slept_ms < 2000 and mc.handler.running.load(.acquire)) {
+        while (slept_ms < delay_ms and mc.handler.running.load(.acquire)) {
             std.Thread.sleep(100 * std.time.ns_per_ms);
             slept_ms += 100;
         }
     }
     rtd.debugLog("massive_rtd: [{s}] worker stopped", .{mc.name});
+}
+
+/// Capped exponential backoff with ±25% jitter.
+///
+/// Base 2s, cap 60s. `attempts=1` gives ~2s, `attempts=2` ~4s, `attempts=3`
+/// ~8s, … saturating at 60s around attempt 6. The jitter spreads out a herd
+/// of XLLs reconnecting after a server-side blip so we don't all hit the
+/// endpoint at exactly the same moment.
+fn nextBackoffMs(mc: *MarketConn) u64 {
+    const base_ms: u64 = 2_000;
+    const cap_ms: u64 = 60_000;
+
+    // Shift by (attempts - 1) since attempts is incremented before this call.
+    // Clamp to a small exponent so the shift can't overflow - the cap below
+    // handles the rest.
+    const shift: u6 = @intCast(@min(mc.reconnect_attempts -| 1, 10));
+    const raw = base_ms << shift;
+    const capped = @min(raw, cap_ms);
+
+    const rng = mc.jitter_rng.random();
+    // Uniform in [-0.25, +0.25] of capped, applied symmetrically.
+    const quarter = capped / 4;
+    const jitter = rng.uintLessThan(u64, quarter * 2 + 1);
+    // capped - quarter can underflow if quarter > capped, which only happens
+    // when capped < 4. Guard it.
+    const lo = if (capped > quarter) capped - quarter else 0;
+    return lo + jitter;
 }
 
 fn workerSession(mc: *MarketConn) !void {
@@ -433,7 +534,7 @@ fn workerSession(mc: *MarketConn) !void {
     };
     try protocol.authenticate(client, gpa, api_key);
     rtd.debugLog("massive_rtd: [{s}] authenticated", .{mc.name});
-    mc.authed.store(true, .release);
+    mc.session_was_authed = true;
 
     // Replay any channels we already have (after a reconnect).
     try flushInitialSubscribes(mc, client);
@@ -446,14 +547,25 @@ fn workerSession(mc: *MarketConn) !void {
     // sit in `pending_sub` until the next inbound frame, causing visible
     // latency on low-traffic feeds. Every `ping_interval_ms` we also send a
     // client-initiated WS ping to keep NAT happy and surface dead connections.
+    //
+    // `recv_deadline_ms` is our liveness check: if nothing has arrived from
+    // the server in that long - no data, no pong, nothing - we declare the
+    // socket half-open and force a reconnect. Without this, a silently-dead
+    // TCP connection would sit there until the OS keepalive kicked in, which
+    // on macOS/Windows can take minutes and leaves every cell stale.
     const poll_timeout_ms: i32 = 2000;
     const ping_interval_ms: i64 = 20_000;
+    const recv_deadline_ms: i64 = 45_000;
     var last_ping_ms = std.time.milliTimestamp();
 
     while (mc.handler.running.load(.acquire)) {
         try flushPending(mc, client);
 
         const now_ms = std.time.milliTimestamp();
+        if (now_ms - client.last_recv_ms >= recv_deadline_ms) {
+            rtd.debugLog("massive_rtd: [{s}] recv deadline ({d}ms) exceeded - forcing reconnect", .{ mc.name, recv_deadline_ms });
+            return error.RecvDeadlineExceeded;
+        }
         if (now_ms - last_ping_ms >= ping_interval_ms) {
             client.sendPing("") catch |err| {
                 rtd.debugLog("massive_rtd: [{s}] ping failed: {s}", .{ mc.name, @errorName(err) });
@@ -477,22 +589,22 @@ fn workerSession(mc: *MarketConn) !void {
 
 fn flushInitialSubscribes(mc: *MarketConn, client: *ws.Client) !void {
     // After a reconnect, re-subscribe to every channel we still care about.
-    // Drain any queued subscribes first (they're redundant with channel_refs),
+    // Drain any queued subscribes first (they're redundant with mc.channels),
     // but keep queued unsubscribes - they still need to be flushed next tick.
     mc.mu.lock();
-    var channels: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer channels.deinit(gpa);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(gpa);
 
-    var it = mc.channel_refs.iterator();
-    while (it.next()) |e| channels.append(gpa, e.key_ptr.*) catch {};
+    var it = mc.channels.iterator();
+    while (it.next()) |e| names.append(gpa, e.key_ptr.*) catch {};
 
     for (mc.pending_sub.items) |s| gpa.free(s);
     mc.pending_sub.clearRetainingCapacity();
     mc.mu.unlock();
 
-    if (channels.items.len == 0) return;
-    rtd.debugLog("massive_rtd: [{s}] re-subscribing {d} channels after reconnect", .{ mc.name, channels.items.len });
-    try protocol.subscribe(client, gpa, channels.items);
+    if (names.items.len == 0) return;
+    rtd.debugLog("massive_rtd: [{s}] re-subscribing {d} channels after reconnect", .{ mc.name, names.items.len });
+    try protocol.subscribe(client, gpa, names.items);
 }
 
 fn flushPending(mc: *MarketConn, client: *ws.Client) !void {
@@ -544,13 +656,27 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
     const ctx = handler.ctx orelse return;
 
     var any_dirty = false;
+    // Lock order throughout the module is Handler -> MarketConn. Dispatch
+    // reads both: Handler.topics for the TopicState we mutate, and
+    // mc.channels to find which topic_ids care about an incoming (ev, sym).
+    // Holding both for the whole frame is fine - onConnect / onDisconnect
+    // also take them in this order.
     handler.mu.lock();
     defer handler.mu.unlock();
+    mc.mu.lock();
+    defer mc.mu.unlock();
 
     // Re-check after acquiring the mutex: onTerminate may have flipped the
     // flag while we were blocked on the lock, and once it's set the main
     // thread is about to free handler.topics from under us.
     if (handler.terminating.load(.acquire)) return;
+
+    // Scratch buffer for building "<ev>.<sym>" channel keys to look up in the
+    // dispatch index. Massive's event prefixes are ≤4 chars and symbols are
+    // bounded well under 64; 96 leaves plenty of headroom.
+    var channel_buf: [96]u8 = undefined;
+
+    const dispatch_start_ms = std.time.milliTimestamp();
 
     for (root.array.items) |evt| {
         if (evt != .object) continue;
@@ -573,15 +699,11 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
         if (sym_val != .string) continue;
         const sym = sym_val.string;
 
-        // Scan subscribed topics. We filter by `market` to avoid cross-market
-        // aliasing if the same <ev>.<sym> happens to exist on two feeds - the
-        // flat `topics` map spans all markets.
-        var it = handler.topics.iterator();
-        while (it.next()) |entry| {
-            const state = entry.value_ptr;
-            if (!std.mem.eql(u8, state.market, mc.name)) continue;
-            if (!std.mem.eql(u8, state.ev, ev)) continue;
-            if (!std.mem.eql(u8, state.sym, sym)) continue;
+        const channel = std.fmt.bufPrint(&channel_buf, "{s}.{s}", .{ ev, sym }) catch continue;
+        const subs = mc.channels.get(channel) orelse continue;
+
+        for (subs.items) |topic_id| {
+            const state = handler.topics.getPtr(topic_id) orelse continue;
 
             const field_name = if (state.field.len > 0) state.field else protocol.defaultFieldFor(ev);
             if (field_name.len == 0) {
@@ -597,8 +719,7 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
                 state.value = .{ .err = @bitCast(@as(u32, 0x80020004)) }; // #N/A
             }
 
-            // Mark dirty in the framework's topic map.
-            if (ctx.topics.getPtr(entry.key_ptr.*)) |tentry| {
+            if (ctx.topics.getPtr(topic_id)) |tentry| {
                 tentry.dirty = true;
                 any_dirty = true;
             }
@@ -606,6 +727,24 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
     }
 
     if (any_dirty and !handler.terminating.load(.acquire)) ctx.notifyExcel();
+
+    // Update the dispatch-time EWMA and, if it's trending high, warn the
+    // user that they're in danger of being disconnected for slow consumption.
+    // The EWMA (alpha=1/8) smooths single-frame blips so we only complain
+    // about sustained lag. Warning is rate-limited to once per 10s so a
+    // workbook in a genuinely bad state doesn't spam the log.
+    const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - dispatch_start_ms));
+    mc.dispatch_ewma_ms = (mc.dispatch_ewma_ms * 7 + elapsed_ms) / 8;
+    if (mc.dispatch_ewma_ms >= 100) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - mc.last_lag_warn_ms >= 10_000) {
+            mc.last_lag_warn_ms = now_ms;
+            rtd.debugLog(
+                "massive_rtd: [{s}] dispatch lagging (~{d}ms/frame avg) - reduce subscriptions or Massive may drop the connection",
+                .{ mc.name, mc.dispatch_ewma_ms },
+            );
+        }
+    }
 }
 
 fn valueFromJson(v: std.json.Value, scratch: std.mem.Allocator) !OwnedValue {

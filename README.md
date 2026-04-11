@@ -1,6 +1,6 @@
-# zigxll-connectors-massive
+# massive-excel
 
-An Excel XLL that streams live market data from the [Massive](https://massive.com) WebSocket API into Excel cells as RTD topics.
+An Excel add-in that streams live market data from the [Massive](https://massive.com) WebSocket API into Excel cells as RTD topics.
 
 Built with [ZigXLL](https://github.com/AlexJReid/zigxll) — everything is pure Zig including the TLS client, the WebSocket framing, and the JSON dispatcher. Zero external dependencies at build time.
 
@@ -13,16 +13,14 @@ In any cell:
 =RTD("zigxll.connectors.massive", , "T.AAPL.s")                 last trade size
 =RTD("zigxll.connectors.massive", , "Q.MSFT.bp")                MSFT bid price
 =RTD("zigxll.connectors.massive", , "Q.MSFT.ap")                MSFT ask price
-=RTD("zigxll.connectors.massive", , "AM.TSLA.vw")               TSLA minute-bar VWAP
+=RTD("zigxll.connectors.massive", , "AM.TSLA.a")                TSLA minute-bar VWAP
 =RTD("zigxll.connectors.massive", , "XT.BTC-USD.p", "crypto")   BTC-USD last trade on the /crypto feed
 =RTD("zigxll.connectors.massive", , "C.EUR/USD.a", "forex")     EUR/USD ask on the /forex feed
 ```
 
-The optional second string picks the **market** — `stocks`, `options`, `forex`, `crypto`, `indices`, or `futures`. Omit it to use the default market baked into the build (see `-Dmassive_path`). The handler lazily opens a dedicated WebSocket for each market the workbook asks for, and keeps it alive for the session.
 
-**Your Massive plan decides which markets you can actually reach.** Subscribing to a market your API key isn't entitled to will fail auth; the RTD handler logs the status message and the affected cells show `#N/A`. See the [Massive pricing page](https://massive.com/pricing) for which plans include which markets. You need a plan that supports websockets.
 
-Or use a convenience wrapper — `=MASSIVE(topic, [market])` takes the full topic string and optional market, and there's one per-event-type wrapper that takes `sym`, optional `field`, and optional `market`:
+Or use the convenience wrappers — `=MASSIVE(topic, [market])` takes the full topic string and optional market, and there's one per-event-type wrapper that takes `sym`, optional `field`, and optional `market`:
 
 ```
 =MASSIVE("T.AAPL.p")                  stocks (default market)
@@ -33,30 +31,63 @@ Or use a convenience wrapper — `=MASSIVE(topic, [market])` takes the full topi
 =MASSIVE.TRADE("AAPL", "s")           T.AAPL.s
 =MASSIVE.TRADE("BTC-USD", "p", "crypto")  T.BTC-USD.p on /crypto
 =MASSIVE.QUOTE("MSFT", "bp")          Q.MSFT.bp      (default field: ap)
-=MASSIVE.AGG_MIN("TSLA", "vw")        AM.TSLA.vw     (default field: c)
-=MASSIVE.AGG_SEC("TSLA")              A.TSLA         (default field: c)
+=MASSIVE.AGG_MINUTE("TSLA", "a")      AM.TSLA.a      (default field: c)
+=MASSIVE.AGG_SECOND("TSLA")           A.TSLA         (default field: c)
 =MASSIVE.FMV("AAPL")                  FMV.AAPL       (default field: fmv)
 =MASSIVE.INDEX("SPX")                 V.SPX on /indices  (default field: val)
 ```
 
-All wrappers delegate to the same RTD server, so subscription refcounting is shared — `=MASSIVE.TRADE("AAPL","p")` and `=RTD(..., "T.AAPL.p")` share one wire subscription. Refcounts are **per-market**, so the same `T.AAPL.p` topic routed to `stocks` vs (hypothetically) another market would be two independent subscriptions.
+The optional second string picks the **market** — `stocks`, `options`, `forex`, `crypto`, `indices`, or `futures`. Omit it to use the default market baked into the build (see `-Dmassive_path`). The handler lazily opens a dedicated WebSocket for each market the workbook asks for, and keeps it alive for the session.
+
+You can of course customise, and define your own wrappers.
+
+**Your Massive plan decides which markets you can actually reach.** Subscribing to a market your API key isn't entitled to will fail auth; the RTD handler logs the status message and the affected cells show `#N/A`. See the [Massive pricing page](https://massive.com/pricing) for w
+
+All wrappers delegate to the same RTD server, so subscription refcounting is shared — `=MASSIVE.TRADE("AAPL","p")` and `=RTD(..., "T.AAPL.p")` share one wire subscription. Refcounts are **per-market**, so the same `T.AAPL.p` topic routed to `stocks` vs another market would be two independent subscriptions.
+
+hich plans include which markets. You need a plan that supports websockets.
 
 **Topic format:** `<ev>.<sym>[.<field>]`
 - `<ev>` — Massive event prefix: `T` (trades), `Q` (quotes), `AM` (per-minute aggs), `A` (per-second aggs), `FMV` (fair market value), `V` (index value)
 - `<sym>` — ticker or pair (e.g. `AAPL`, `BTC-USD`)
-- `<field>` — any field name from the Massive message (e.g. `p`, `s`, `bp`, `ap`, `vw`, `c`, `h`, `l`, `o`, `v`). Omit for a sensible default per event type.
+- `<field>` — any field name from the Massive message. Omit for a sensible default per event type.
+
+Field names (see the [Massive websocket docs](https://massive.com/docs/websocket/quickstart#message-formats-&-multiple-events) for the full per-event schema — the same one-letter code can mean different things under different events, so read it alongside the event prefix):
+
+| Field | Meaning | Event |
+|---|---|---|
+| `ev` | event type | all |
+| `sym` | symbol | all |
+| `p` | price (last trade / FMV) | `T`, `FMV` |
+| `s` | trade size | `T` |
+| `s` | start timestamp of the bar (Unix ms) | `AM`, `A` |
+| `e` | end timestamp of the bar (Unix ms) | `AM`, `A` |
+| `t` | event timestamp (Unix ms) | `T`, `Q` |
+| `x` | exchange id | `T`, `Q` |
+| `bp` | bid price | `Q` |
+| `bs` | bid size | `Q` |
+| `ap` | ask price | `Q` |
+| `as` | ask size | `Q` |
+| `o` | open of the bar | `AM`, `A` |
+| `h` | high of the bar | `AM`, `A` |
+| `l` | low of the bar | `AM`, `A` |
+| `c` | close of the bar | `AM`, `A` |
+| `v` | volume in the bar | `AM`, `A` |
+| `a` | VWAP (volume-weighted avg price) | `AM`, `A` |
+| `val` | index value | `V` |
+
 
 **One subscription per channel.** If you have cells for both `T.AAPL.p` and `T.AAPL.s`, only **one** `T.AAPL` subscribe is sent to Massive. All cells update from the same event stream via refcounting. Once all `T.AAPL.*` topics are removed, the unsubscribe is sent.
 
 ## Prerequisites
 
-### 1. Zig toolchain
+### 1. Zig
 
 Zig 0.15.1 or later. Install via `brew install zig`, your package manager, or from [ziglang.org/download](https://ziglang.org/download).
 
 ### 2. Windows SDK (only needed to build the XLL)
 
-The XLL cross-compiles from macOS/linux to Windows using [xwin](https://jake-shadle.github.io/xwin/) to fetch the MSVC headers and libs. Native Windows builds don't need this.
+The XLL cross-compiles from macOS/linux to Windows using [xwin](https://jake-shadle.github.io/xwin/) to fetch the MSVC headers and libs. Native Windows builds don't need this, but do need the Windows SDK installing. The Windows GitHub Actions runners are ready to go in this regard.
 
 **macOS:**
 ```bash
@@ -89,12 +120,12 @@ The key is re-read on every reconnect, so rotating it (on disk or in the env) ta
 
 ```bash
 zig build              # XLL (zig-out/lib/standalone.xll) — cross-compiles to Windows
-zig build massive-cli  # native CLI smoke-tester (zig-out/bin/massive-cli)
+zig build massive-cli  # CLI smoke-tester (zig-out/bin/massive-cli)
 ```
 
 By default the XLL and CLI connect to `wss://delayed.massive.com` and use `/stocks` as the **default market** (15-minute delayed, usually free). A single build can talk to any market your API key allows — cells pick the market at runtime via the optional second RTD parameter.
 
-Host / port / default path / TLS behaviour / API key are all configured at **runtime** via a `config.json` file dropped next to the XLL (or in `%APPDATA%\zigxll-massive\`). Same binary serves mock and prod; the config file decides. Example:
+The host / port / default path / TLS behaviour / API key are all configured at **runtime** via a `config.json` file dropped next to the XLL (or in `%APPDATA%\zigxll-massive\`). Same binary serves mock and prod; the config file decides. Example:
 
 ```json
 {
@@ -108,9 +139,9 @@ Host / port / default path / TLS behaviour / API key are all configured at **run
 
 See `src/config.json.example` for a template. All fields are optional — missing ones fall back to compile-time defaults. `$MASSIVE_API_KEY` in the environment overrides `api_key` if both are set.
 
-The `-Dmassive_*` build flags still exist and set the **compile-time defaults** used when no config file is present, for reproducible CI builds. Most users should ignore them.
+The `-Dmassive_*` build flags exist and set the **compile-time defaults** used when no config file is present, for reproducible CI builds. Most users should ignore them.
 
-**Access is plan-dependent.** Massive sells market access per asset class; a given API key will only authenticate against markets your plan covers. A connection to a non-entitled market will fail auth — the affected cells show `#N/A`.
+**As stated, market (and websocket) access is plan-dependent.** Massive sells market access per asset class; a given API key will only authenticate against markets your plan covers. A connection to a non-entitled market will fail auth — the affected cells show `#N/A`.
 
 ## Run the XLL in Excel
 
@@ -249,6 +280,7 @@ Key source files:
 
 - **Market access depends on your Massive plan.** Each market (`stocks`, `options`, `forex`, `crypto`, `indices`, `futures`) is a separate WebSocket endpoint. You can only connect to markets your API key is entitled to. The handler opens a connection lazily when the first topic for a market appears; if auth fails, the worker logs the status message and retries on the 2s reconnect timer. Cells pointed at unauthorized markets stay `#N/A`.
 - **One connection per market.** Massive doesn't offer a multiplexed endpoint — each market is its own `wss://.../<market>` URL. The handler holds one connection per active market and shares it across all cells on that market.
+- **One concurrent connection per asset class per API key.** Massive caps you at one live WebSocket per asset class (`stocks`, `crypto`, etc.) by default — contact Massive support if you need more. Running two Excel instances against the same key on the same market will fail auth on the second instance; its cells stay `#N/A` and the worker exits after logging the terminal error (no reconnect hammering).
 - **Sub/unsub latency between market hours.** Each worker uses a 2s `poll`-gated read (`readMessageTimeout`) so queued sub/unsub actions flush on the next tick even when the server is idle. It also sends a client-initiated WS ping every 20s to keep NAT mappings warm. Intraday latency is sub-second; worst-case off-hours latency is the poll interval.
 - **64 KiB single-frame cap.** Fragmented or huge frames will error. Safe for the Massive wire format (messages are small).
 - **Reconnect.** On drop, the worker reconnects with a fixed 2s backoff forever, re-authenticates, and re-subscribes to all currently-live channels.

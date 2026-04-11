@@ -11,7 +11,7 @@ if [[ -z "${ip}" ]]; then
     exit 1
 fi
 
-echo "building XLL"
+echo "building XLL and mock config"
 zig build
 
 cat > zig-out/lib/config.json <<EOF
@@ -30,5 +30,5 @@ echo "  zig-out/lib/config.json  (host=${ip}:8443, insecure, api_key=test-key)"
 echo
 echo "next:"
 echo "  1. start the mock on this machine:  node tools/mock_server.js"
-echo "  2. copy BOTH files from zig-out/lib/ to the Windows box"
+echo "  2. copy BOTH files from zig-out/lib/ to the Windows machine (if different)"
 echo "  3. load the XLL in Excel and try =MASSIVE(\"T.AAPL.p\")"
