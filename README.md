@@ -37,13 +37,15 @@ An Excel add-in that streams live market data from the [Massive](https://massive
    =MASSIVE("T.AAPL.p")
    ```
 
-   It should start updating with live AAPL trade prices. See [What you can do with it](#what-you-can-do-with-it) for the full topic format.
+   It should start updating with live AAPL trade prices. See next section for the full topic format.
 
-## What you can do with it
+## API coverage
 
 There's one Excel UDF per (market, event), so the market is part of the function name and there's no chance of routing a stocks-shaped channel to a crypto socket. Each wrapper takes a symbol and an optional field; omit the field to get a sensible default.
 
 <img src="doc/funclist.png" alt="Massive UDFs in Excel's function browser" width="75%">
+
+### Some examples
 
 ```
 =MASSIVE.STOCKS.TRADE("AAPL")                last AAPL trade price (T.AAPL.p)
@@ -67,11 +69,11 @@ All UDFs route through the same RTD server, so refcounting is shared. `=MASSIVE.
 
 **Market access depends on your Massive plan.** Each market is a separate WebSocket endpoint (`wss://.../<market>`). Subscribing to one your API key isn't entitled to fails auth and the affected cells stay `#N/A`. See [Massive pricing](https://massive.com/pricing) for which plans cover which markets. You need one that includes WebSocket access.
 
-### UDF reference
-
-Default field is what you get when the second argument is omitted. `<ev>` is the Massive wire prefix the wrapper sends; the wire channel is `<ev>.<sym>`.
+### Excel function reference
 
 <img src="doc/funcargs.png" alt="Function Arguments dialog showing symbol and field inputs" width="75%">
+
+Default field is what you get when the second argument is omitted. `<ev>` is the Massive wire prefix the wrapper sends; the wire channel is `<ev>.<sym>`.
 
 | UDF | Wire `<ev>` | Endpoint | Default field |
 |---|---|---|---|
@@ -524,8 +526,8 @@ Key source files:
 
 Some of the more repetitive work of mirroring the Massive API surface into Excel — the per-event wrapper functions, field mappings, and similar boilerplate — was generated with the help of AI agents. The output has been reviewed, but if you spot something off, please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues).
 
-## Commercial support
+## Commercial
 
-My company [Lexvica Limited](https://lexvica.com) can help with all aspects of your market data, including Excel, NATS, Zig, and Go — give us a shout.
+My company [Lexvica Limited](https://lexvica.com) can help with all aspects of your market data estate, including Excel integrations like this one, NATS, Zig, and Go.
 
-This software is freely available to use and modify; if you're using it I'd love to hear from you — [alex@lexvica.com](mailto:alex@lexvica.com).
+This software is free to use and modify; if you're using it I'd love to hear from you - [alex@lexvica.com](mailto:alex@lexvica.com).
