@@ -37,9 +37,9 @@ An Excel add-in that streams live market data from the [Massive](https://massive
    =MASSIVE("T.AAPL.p")
    ```
 
-   It should start updating with live AAPL trade prices. See [What you can do with it](#what-you-can-do-with-it) for the full topic format.
+   It should start updating with live AAPL trade prices. See next section for the full topic format.
 
-## What you can do with it
+## API coverage
 
 There's one Excel UDF per (market, event), so the market is part of the function name and there's no chance of routing a stocks-shaped channel to a crypto socket. Each wrapper takes a symbol and an optional field; omit the field to get a sensible default.
 
