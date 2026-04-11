@@ -523,3 +523,9 @@ Key source files:
 ## A note on AI assistance
 
 Some of the more repetitive work of mirroring the Massive API surface into Excel — the per-event wrapper functions, field mappings, and similar boilerplate — was generated with the help of AI agents. The output has been reviewed, but if you spot something off, please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues).
+
+## Commercial support
+
+My company [Lexvica Limited](https://lexvica.com) can help with all aspects of your market data, including Excel, NATS, Zig, and Go — give us a shout.
+
+This software is freely available to use and modify; if you're using it I'd love to hear from you — [alex@lexvica.com](mailto:alex@lexvica.com).
