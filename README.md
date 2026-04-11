@@ -67,11 +67,11 @@ All UDFs route through the same RTD server, so refcounting is shared. `=MASSIVE.
 
 **Market access depends on your Massive plan.** Each market is a separate WebSocket endpoint (`wss://.../<market>`). Subscribing to one your API key isn't entitled to fails auth and the affected cells stay `#N/A`. See [Massive pricing](https://massive.com/pricing) for which plans cover which markets. You need one that includes WebSocket access.
 
-### UDF reference
-
-Default field is what you get when the second argument is omitted. `<ev>` is the Massive wire prefix the wrapper sends; the wire channel is `<ev>.<sym>`.
+### Excel function reference
 
 <img src="doc/funcargs.png" alt="Function Arguments dialog showing symbol and field inputs" width="75%">
+
+Default field is what you get when the second argument is omitted. `<ev>` is the Massive wire prefix the wrapper sends; the wire channel is `<ev>.<sym>`.
 
 | UDF | Wire `<ev>` | Endpoint | Default field |
 |---|---|---|---|
