@@ -140,9 +140,6 @@ const MarketConn = struct {
     // --- Background thread state (written by Handler, read by worker) ---
     worker_thread: ?std.Thread = null,
     authed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Socket handle shared with Handler.onTerminate so it can force-close
-    /// the in-flight read. 0 = no active socket.
-    active_sock: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // --- Protected by `mu` ---
     mu: std.Thread.Mutex = .{},
@@ -182,6 +179,11 @@ const MarketConn = struct {
 const Handler = struct {
     ctx: ?*rtd.RtdContext = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by onTerminate BEFORE running=false. Workers re-check this after
+    /// acquiring handler.mu and before touching handler.topics or calling
+    /// ctx.notifyExcel, so a dispatch in flight when teardown starts can't
+    /// race the main thread freeing state from under it.
+    terminating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Protects `topics` and `markets`. Per-market state has its own mutex
     /// inside MarketConn.
@@ -304,10 +306,15 @@ const Handler = struct {
 
     pub fn onTerminate(self: *Handler, _: *rtd.RtdContext) void {
         rtd.debugLog("massive_rtd: onTerminate", .{});
+        // Order matters: set `terminating` BEFORE `running=false` so any
+        // worker that observes running still true will already see the
+        // notify-suppression flag on its next dispatch.
+        self.terminating.store(true, .release);
         self.running.store(false, .release);
 
         // Snapshot the market list so we can iterate without holding the
-        // handler mutex (join may block).
+        // handler mutex (join may block, and a worker that's currently
+        // dispatching needs `self.mu` to finish and release).
         self.mu.lock();
         var market_list: std.ArrayListUnmanaged(*MarketConn) = .empty;
         defer market_list.deinit(gpa);
@@ -315,12 +322,12 @@ const Handler = struct {
         while (mit.next()) |e| market_list.append(gpa, e.value_ptr.*) catch {};
         self.mu.unlock();
 
-        // Interrupt each worker's in-flight read by force-closing its socket,
-        // then join.
-        for (market_list.items) |mc| {
-            const sock = mc.active_sock.swap(0, .acq_rel);
-            if (sock != 0) closeSocket(sock);
-        }
+        // Let workers exit on their own. The read loop polls with a 2s
+        // timeout and re-checks `running` between polls, so every worker
+        // exits within ~2s without us force-closing the socket. We do NOT
+        // closesocket() from here: on Windows, closing a socket while
+        // another thread is inside WSAPoll on it is undefined behavior and
+        // was observed to crash Excel during teardown.
         for (market_list.items) |mc| {
             if (mc.worker_thread) |t| {
                 t.join();
@@ -328,7 +335,9 @@ const Handler = struct {
             }
         }
 
-        // Free all owned state.
+        // Workers are gone. Hold self.mu across the free purely for symmetry
+        // with onDisconnect's locking discipline - nothing else should be
+        // touching these maps now.
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -390,22 +399,6 @@ fn isKnownMarket(name: []const u8) bool {
     return false;
 }
 
-fn closeSocket(raw: usize) void {
-    // Cross-platform socket close. net.Stream.Handle is SOCKET on Windows
-    // (which is a pointer-sized handle) and an int fd on posix.
-    if (@import("builtin").os.tag == .windows) {
-        const SOCKET = std.os.windows.ws2_32.SOCKET;
-        const s: SOCKET = @ptrFromInt(raw);
-        _ = std.os.windows.ws2_32.closesocket(s);
-    } else {
-        std.posix.close(@intCast(raw));
-    }
-}
-
-fn sockToUsize(h: std.net.Stream.Handle) usize {
-    return if (@import("builtin").os.tag == .windows) @intFromPtr(h) else @intCast(h);
-}
-
 // ============================================================================
 // Worker thread (one per MarketConn)
 // ============================================================================
@@ -444,9 +437,6 @@ fn workerSession(mc: *MarketConn) !void {
         .insecure_skip_verify = insecure_tls,
     });
     defer client.deinit();
-
-    mc.active_sock.store(sockToUsize(client.stream.handle), .release);
-    defer mc.active_sock.store(0, .release);
 
     // Greet / auth handshake. Key is loaded fresh each session so rotating it
     // on disk takes effect on the next reconnect - no XLL rebuild needed.
@@ -522,6 +512,11 @@ fn flushInitialSubscribes(mc: *MarketConn, client: *ws.Client) !void {
 }
 
 fn flushPending(mc: *MarketConn, client: *ws.Client) !void {
+    // If we're terminating, don't bother sending queued sub/unsub - the
+    // socket is about to be yanked and the server will notice. Leave the
+    // queued strings in place so MarketConn.deinit frees them.
+    if (mc.handler.terminating.load(.acquire)) return;
+
     // Snapshot queued sub/unsub lists under the lock, release, then send.
     // Owns the moved-out strings so we free after sending.
     mc.mu.lock();
@@ -549,6 +544,10 @@ fn flushPending(mc: *MarketConn, client: *ws.Client) !void {
 // ============================================================================
 
 fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
+    // If we're tearing down, don't touch handler/ctx at all - onTerminate may
+    // be actively freeing the framework's topic map from the main thread.
+    if (mc.handler.terminating.load(.acquire)) return;
+
     // Every data message is a JSON array of event objects. Parse into the
     // per-market frame arena; reset once at the top so we reuse pages.
     _ = mc.frame_arena.reset(.retain_capacity);
@@ -563,6 +562,11 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
     var any_dirty = false;
     handler.mu.lock();
     defer handler.mu.unlock();
+
+    // Re-check after acquiring the mutex: onTerminate may have flipped the
+    // flag while we were blocked on the lock, and once it's set the main
+    // thread is about to free handler.topics from under us.
+    if (handler.terminating.load(.acquire)) return;
 
     for (root.array.items) |evt| {
         if (evt != .object) continue;
@@ -617,7 +621,7 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
         }
     }
 
-    if (any_dirty) ctx.notifyExcel();
+    if (any_dirty and !handler.terminating.load(.acquire)) ctx.notifyExcel();
 }
 
 fn valueFromJson(v: std.json.Value, scratch: std.mem.Allocator) !OwnedValue {

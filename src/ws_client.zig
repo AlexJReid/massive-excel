@@ -117,7 +117,7 @@ pub const Client = struct {
             self.stream_reader.interface(),
             &self.stream_writer.interface,
             .{
-                .host = .{ .explicit = host },
+                .host = if (options.insecure_skip_verify) .no_verification else .{ .explicit = host },
                 .ca = if (options.insecure_skip_verify) .no_verification else .{ .bundle = ca_bundle },
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
