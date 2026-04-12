@@ -334,8 +334,14 @@ function createReplayCursor(ws, getSubs) {
                 if (subs.has(ch)) batch.push(e);
                 idx++;
             }
-            if (batch.length > 0) {
-                ws.send(JSON.stringify(batch));
+            // Chunk large batches into multiple WS frames. At market-open
+            // timestamps the replay can produce hundreds of subscribed
+            // events in a single ms; sending them as one giant frame
+            // overwhelms slow RTD consumers (Excel's STA pump backs up).
+            // MOCK_CHUNK_SIZE bounds how many events go into one ws.send().
+            const CHUNK = parseInt(process.env.MOCK_CHUNK_SIZE || '32', 10);
+            for (let i = 0; i < batch.length; i += CHUNK) {
+                ws.send(JSON.stringify(batch.slice(i, i + CHUNK)));
             }
             scheduleNext();
         }, delay);

@@ -740,10 +740,15 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
                 state.value = .{ .err = @bitCast(@as(u32, 0x80020004)) }; // #N/A
             }
 
+            // ctx.topics is owned by the framework and mutated on the main
+            // thread by ConnectData/DisconnectData. Access it only under
+            // ctx.topics_mu to avoid racing a hashmap rehash.
+            ctx.topics_mu.lock();
             if (ctx.topics.getPtr(topic_id)) |tentry| {
                 tentry.dirty = true;
                 any_dirty = true;
             }
+            ctx.topics_mu.unlock();
         }
     }
 
