@@ -69,31 +69,54 @@ zig build run-cli -Dmassive_host=localhost -Dmassive_port=8443 -Dmassive_insecur
 
 ## fetch_flatfile.js
 
-Downloads a Massive flat file for use with replay mode.
+Downloads a Massive flat file (gzipped CSV from their S3-compatible endpoint)
+for use with replay mode. Requires S3 credentials from your Massive dashboard.
 
 ```bash
-# Set your API key
-export MASSIVE_API_KEY=your_key_here
+export MASSIVE_S3_ACCESS_KEY=your_access_key
+export MASSIVE_S3_SECRET_KEY=your_secret_key
+```
 
-# Fetch stock trades for a date
-node tools/fetch_flatfile.js stocks/trades 2026-04-10
+### Examples
 
-# Output: data/stocks_trades_2026-04-10.json.gz
+```bash
+# Minute aggregates — works with Stocks Basic plan
+node tools/fetch_flatfile.js us_stocks_sip/minute_aggs_v1 2026-04-10
+
+# Per-trade ticks — requires Stocks Advanced+
+node tools/fetch_flatfile.js us_stocks_sip/trades_v1 2026-04-10
+
+# Per-quote NBBO — requires Stocks Advanced+
+node tools/fetch_flatfile.js us_stocks_sip/quotes_v1 2026-04-10
+
+# Crypto trades — requires Crypto plan
+node tools/fetch_flatfile.js crypto_trades 2026-04-10 data/crypto.csv.gz
 ```
 
 ### Usage
 
 ```
-node tools/fetch_flatfile.js <endpoint> <date> [outfile]
+node tools/fetch_flatfile.js <prefix> <date> [outfile]
 ```
 
-**Endpoints:** `stocks/trades`, `stocks/quotes`, `crypto/trades`,
-`options/trades`, `forex/quotes`, etc.
+Output defaults to `data/<prefix-with-slashes-replaced>_<date>.csv.gz`.
+Override with the third argument.
 
-Output defaults to `data/<endpoint>_<date>.json.gz`. Override with the
-third argument.
+**Available prefixes** depend on your Massive plan. A 403 typically means
+your plan doesn't cover the requested prefix. Discover prefixes with:
 
-Set `MASSIVE_FLAT_HOST` to override the API host (default: `api.polygon.io`).
+```bash
+aws s3 ls s3://flatfiles/ --endpoint-url https://files.massive.com
+```
+
+### Environment variables
+
+| Variable               | Default                      | Description                    |
+|------------------------|------------------------------|--------------------------------|
+| `MASSIVE_S3_ACCESS_KEY`| *(required)*                 | S3 access key from dashboard   |
+| `MASSIVE_S3_SECRET_KEY`| *(required)*                 | S3 secret key from dashboard   |
+| `MASSIVE_S3_ENDPOINT`  | `https://files.massive.com`  | Override S3 endpoint           |
+| `MASSIVE_S3_BUCKET`    | `flatfiles`                  | Override bucket name           |
 
 ## gen_cert.sh
 
