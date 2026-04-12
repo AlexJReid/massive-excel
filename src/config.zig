@@ -91,32 +91,10 @@ fn buildConfig() Config {
         .api_key = null,
     };
 
-    // Merge JSON file if one is reachable. JSON strings must be duped into
-    // long-lived storage because the parser's arena is torn down before we
-    // return.
+    // Merge JSON file if one is reachable.
     if (readConfigFile(alloc)) |content| {
         defer alloc.free(content);
-        if (std.json.parseFromSlice(JsonConfig, alloc, content, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        })) |parsed| {
-            defer parsed.deinit();
-            const j = parsed.value;
-            if (j.host) |h| cfg.host = alloc.dupe(u8, h) catch cfg.host;
-            if (j.port) |p| cfg.port = p;
-            if (j.path) |p| cfg.path = alloc.dupe(u8, p) catch cfg.path;
-            if (j.insecure) |i| cfg.insecure = i;
-            if (j.api_key) |k| {
-                const trimmed = std.mem.trim(u8, k, " \t\r\n");
-                if (trimmed.len > 0) {
-                    cfg.api_key = alloc.dupe(u8, trimmed) catch null;
-                }
-            }
-        } else |err| {
-            // Bad JSON isn't fatal — fall back to defaults and let the caller
-            // surface the issue (init() will alert if api_key is still null).
-            debugLog("config: JSON parse error: {s}", .{@errorName(err)});
-        }
+        mergeJsonInto(&cfg, alloc, content);
     }
 
     // Environment variable wins over the JSON file so rotating keys without
@@ -139,6 +117,35 @@ fn buildConfig() Config {
     }
 
     return cfg;
+}
+
+/// Apply every field the JSON supplies to `cfg`, dup'ing strings onto `alloc`
+/// so they outlive the parser's arena. Fields absent from the JSON, present
+/// but empty (for `api_key`), or causing a dup failure are left untouched.
+/// Malformed JSON is logged and otherwise swallowed — by design, so a corrupt
+/// config file can't prevent the binary from starting.
+pub fn mergeJsonInto(cfg: *Config, alloc: std.mem.Allocator, content: []const u8) void {
+    const parsed = std.json.parseFromSlice(JsonConfig, alloc, content, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        // Bad JSON isn't fatal — fall back to defaults and let the caller
+        // surface the issue (init() will alert if api_key is still null).
+        debugLog("config: JSON parse error: {s}", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit();
+    const j = parsed.value;
+    if (j.host) |h| cfg.host = alloc.dupe(u8, h) catch cfg.host;
+    if (j.port) |p| cfg.port = p;
+    if (j.path) |p| cfg.path = alloc.dupe(u8, p) catch cfg.path;
+    if (j.insecure) |i| cfg.insecure = i;
+    if (j.api_key) |k| {
+        const trimmed = std.mem.trim(u8, k, " \t\r\n");
+        if (trimmed.len > 0) {
+            cfg.api_key = alloc.dupe(u8, trimmed) catch null;
+        }
+    }
 }
 
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
@@ -312,4 +319,115 @@ fn getAppDataDir(alloc: std.mem.Allocator) ?[]u8 {
     const len = win.GetEnvironmentVariableA("APPDATA", &buf, win.MAX_PATH);
     if (len == 0 or len >= win.MAX_PATH) return null;
     return alloc.dupe(u8, buf[0..len]) catch null;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+//
+// These cover the pure JSON → Config merge. File discovery (Win32 CreateFileA,
+// %APPDATA%, cwd search) and env-var handling are tested end-to-end by
+// running the CLI against the mock — the bugs there are in path resolution
+// and would pass any unit test we could write without a real filesystem.
+
+fn testDefaults() Config {
+    return .{
+        .host = "default.example.com",
+        .port = 443,
+        .path = "/stocks",
+        .insecure = false,
+        .api_key = null,
+    };
+}
+
+test "mergeJsonInto overlays every field present in the JSON" {
+    const alloc = std.testing.allocator;
+    // Defaults are static strings so mergeJsonInto's overwrite doesn't leak
+    // (mirrors the real call site, where defaults come from build options
+    // that are comptime constants, not heap allocations).
+    var cfg = testDefaults();
+
+    const json =
+        \\{"host":"socket.massive.com","port":8443,"path":"/crypto",
+        \\ "insecure":true,"api_key":"pk_live_test"}
+    ;
+    mergeJsonInto(&cfg, alloc, json);
+    defer alloc.free(cfg.host);
+    defer alloc.free(cfg.path);
+    defer alloc.free(cfg.api_key.?);
+
+    try std.testing.expectEqualStrings("socket.massive.com", cfg.host);
+    try std.testing.expectEqual(@as(u16, 8443), cfg.port);
+    try std.testing.expectEqualStrings("/crypto", cfg.path);
+    try std.testing.expect(cfg.insecure);
+    try std.testing.expectEqualStrings("pk_live_test", cfg.api_key.?);
+}
+
+test "mergeJsonInto leaves absent fields at their defaults" {
+    const alloc = std.testing.allocator;
+    var cfg = testDefaults();
+
+    // Only api_key supplied — host/port/path/insecure must survive untouched.
+    mergeJsonInto(&cfg, alloc, "{\"api_key\":\"k\"}");
+    defer if (cfg.api_key) |k| alloc.free(k);
+
+    try std.testing.expectEqualStrings("default.example.com", cfg.host);
+    try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expectEqualStrings("/stocks", cfg.path);
+    try std.testing.expect(!cfg.insecure);
+    try std.testing.expectEqualStrings("k", cfg.api_key.?);
+}
+
+test "mergeJsonInto trims whitespace around api_key and drops empty keys" {
+    const alloc = std.testing.allocator;
+    var cfg = testDefaults();
+
+    // Leading/trailing whitespace stripped — covers pk pasted from a terminal
+    // that picked up a trailing newline.
+    mergeJsonInto(&cfg, alloc, "{\"api_key\":\"  pk_trimmed\\n\"}");
+    try std.testing.expectEqualStrings("pk_trimmed", cfg.api_key.?);
+    alloc.free(cfg.api_key.?);
+    cfg.api_key = null;
+
+    // Whitespace-only key is treated as absent, not as an empty string —
+    // otherwise the env-var fallback after mergeJsonInto would be shadowed.
+    mergeJsonInto(&cfg, alloc, "{\"api_key\":\"   \"}");
+    try std.testing.expect(cfg.api_key == null);
+}
+
+test "mergeJsonInto swallows malformed JSON and leaves cfg untouched" {
+    const alloc = std.testing.allocator;
+    var cfg = testDefaults();
+
+    // Deliberately broken — unterminated string.
+    mergeJsonInto(&cfg, alloc, "{\"host\":\"oops");
+    try std.testing.expectEqualStrings("default.example.com", cfg.host);
+    try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expect(cfg.api_key == null);
+}
+
+test "mergeJsonInto ignores unknown fields so config schema can evolve" {
+    const alloc = std.testing.allocator;
+    var cfg = testDefaults();
+    defer if (cfg.api_key) |k| alloc.free(k);
+
+    mergeJsonInto(&cfg,
+        alloc,
+        \\{"api_key":"k","future_field":"whatever","another":{"nested":true}}
+    );
+    try std.testing.expectEqualStrings("k", cfg.api_key.?);
+    try std.testing.expectEqualStrings("default.example.com", cfg.host);
+}
+
+test "Config.defaultMarket strips the leading slash" {
+    const c1: Config = .{ .host = "", .port = 0, .path = "/stocks", .insecure = false, .api_key = null };
+    try std.testing.expectEqualStrings("stocks", c1.defaultMarket());
+
+    // Defensive: if someone sets path without a slash we still get something
+    // usable (the topic router compares against this string verbatim).
+    const c2: Config = .{ .host = "", .port = 0, .path = "crypto", .insecure = false, .api_key = null };
+    try std.testing.expectEqualStrings("crypto", c2.defaultMarket());
+
+    const c3: Config = .{ .host = "", .port = 0, .path = "", .insecure = false, .api_key = null };
+    try std.testing.expectEqualStrings("", c3.defaultMarket());
 }

@@ -783,25 +783,141 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
     }
 }
 
-fn valueFromJson(v: std.json.Value, scratch: std.mem.Allocator) !OwnedValue {
+/// Scalar-typed projection of a JSON value into the shape an RTD cell can
+/// hold. Strings are returned as UTF-8 slices borrowing from the scratch
+/// arena (or, for `.string` inputs, from the original JSON buffer). Kept
+/// pure and allocation-light so it's testable without touching the COM/RTD
+/// layer — `toOwnedValue` does the UTF-16 conversion for Excel.
+const IntermediateValue = union(enum) {
+    int: i32,
+    double: f64,
+    boolean: bool,
+    /// UTF-8. Borrowed — caller must copy before the scratch arena resets.
+    string_utf8: []const u8,
+    /// `#N/A` sentinel. We map JSON null to this so empty payload fields
+    /// render as an Excel error rather than a zero.
+    na,
+};
+
+const NA_ERR: i32 = @bitCast(@as(u32, 0x80020004));
+
+fn classify(v: std.json.Value, scratch: std.mem.Allocator) !IntermediateValue {
     return switch (v) {
+        // JSON integers that fit i32 stay integers so Excel shows them
+        // without a decimal; anything wider falls back to f64 (losing
+        // precision past 2^53, but Massive's integer fields are all well
+        // under that).
         .integer => |i| if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32))
-            OwnedValue{ .int = @intCast(i) }
+            IntermediateValue{ .int = @intCast(i) }
         else
-            OwnedValue{ .double = @floatFromInt(i) },
+            IntermediateValue{ .double = @floatFromInt(i) },
         .float => |f| .{ .double = f },
+        // `number_string` appears when the parser can't fit the number into
+        // its own numeric types. Round-trip through parseFloat; on failure
+        // surface 0 rather than an error so a single odd field doesn't
+        // poison the whole frame.
         .number_string => |s| .{ .double = std.fmt.parseFloat(f64, s) catch 0.0 },
         .bool => |b| .{ .boolean = b },
-        .string => |s| try makeStringValue(s),
-        .null => .{ .err = @bitCast(@as(u32, 0x80020004)) },
-        .array, .object => try makeStringValue(try std.json.Stringify.valueAlloc(scratch, v, .{})),
+        .string => |s| .{ .string_utf8 = s },
+        .null => .na,
+        // Nested arrays/objects get stringified into the frame arena and
+        // surfaced as strings. Rare — only hits if a user asks for a field
+        // whose value is itself a structure.
+        .array, .object => .{ .string_utf8 = try std.json.Stringify.valueAlloc(scratch, v, .{}) },
     };
+}
+
+fn toOwnedValue(iv: IntermediateValue) !OwnedValue {
+    return switch (iv) {
+        .int => |v| .{ .int = v },
+        .double => |v| .{ .double = v },
+        .boolean => |v| .{ .boolean = v },
+        .string_utf8 => |s| .{ .string = try std.unicode.utf8ToUtf16LeAlloc(gpa, s) },
+        .na => .{ .err = NA_ERR },
+    };
+}
+
+fn valueFromJson(v: std.json.Value, scratch: std.mem.Allocator) !OwnedValue {
+    return toOwnedValue(try classify(v, scratch));
 }
 
 fn makeStringValue(utf8: []const u8) !OwnedValue {
     // Convert UTF-8 to UTF-16 for the RTD layer. Lives beyond the frame arena,
     // so allocate on the long-lived gpa.
     return .{ .string = try std.unicode.utf8ToUtf16LeAlloc(gpa, utf8) };
+}
+
+test "classify maps JSON scalars to the right cell type" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    // Small integer stays an int.
+    {
+        const iv = try classify(.{ .integer = 42 }, scratch);
+        try std.testing.expectEqual(@as(i32, 42), iv.int);
+    }
+    // Integer beyond i32 range promotes to f64 (loses exactness past 2^53,
+    // but this path is for timestamps-as-ints etc. where the caller already
+    // accepted that).
+    {
+        const big: i64 = @as(i64, std.math.maxInt(i32)) + 1;
+        const iv = try classify(.{ .integer = big }, scratch);
+        try std.testing.expect(iv == .double);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(big)), iv.double);
+    }
+    // Negative i32 boundary.
+    {
+        const iv = try classify(.{ .integer = std.math.minInt(i32) }, scratch);
+        try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), iv.int);
+    }
+    // Float, bool, string, null.
+    {
+        const iv = try classify(.{ .float = 3.14 }, scratch);
+        try std.testing.expectEqual(@as(f64, 3.14), iv.double);
+    }
+    {
+        const iv = try classify(.{ .bool = true }, scratch);
+        try std.testing.expect(iv.boolean);
+    }
+    {
+        const iv = try classify(.{ .string = "AAPL" }, scratch);
+        try std.testing.expectEqualStrings("AAPL", iv.string_utf8);
+    }
+    {
+        const iv = try classify(.null, scratch);
+        try std.testing.expect(iv == .na);
+    }
+    // `number_string` for too-wide numbers — succeeds on valid, falls back to 0.
+    {
+        const iv = try classify(.{ .number_string = "1.5e10" }, scratch);
+        try std.testing.expectEqual(@as(f64, 1.5e10), iv.double);
+    }
+    {
+        const iv = try classify(.{ .number_string = "not-a-number" }, scratch);
+        try std.testing.expectEqual(@as(f64, 0.0), iv.double);
+    }
+}
+
+test "classify stringifies nested arrays and objects into the scratch arena" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    // Build a JSON array [1, 2, 3] without a live parser.
+    var items: [3]std.json.Value = .{
+        .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 },
+    };
+    const arr_val: std.json.Value = .{ .array = std.json.Array.fromOwnedSlice(scratch, &items) };
+    const iv = try classify(arr_val, scratch);
+    try std.testing.expectEqualStrings("[1,2,3]", iv.string_utf8);
+}
+
+test "toOwnedValue surfaces JSON null as Excel #N/A" {
+    const ov = try toOwnedValue(.na);
+    try std.testing.expectEqual(NA_ERR, ov.err);
 }
 
 // ============================================================================

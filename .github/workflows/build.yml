@@ -40,6 +40,9 @@ jobs:
       with:
         version: 0.15.1
 
+    - name: Run tests
+      run: zig build test --summary all
+
     - name: Build XLL
       run: |
         zig build --release=small

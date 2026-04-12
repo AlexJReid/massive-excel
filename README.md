@@ -395,7 +395,7 @@ The RTD server registers itself in `HKCU\Software\Classes` on load, so no admin 
 
 ## Smoke-test without Excel (mac/linux/windows)
 
-A native binary that exercises the TLS client, WS framing, auth handshake and JSON dispatch against a local mock server.
+A native binary that exercises the TLS client, WS framing, auth handshake and JSON dispatch against a local mock server. See [`tools/README.md`](tools/README.md) for the mock server's replay mode, environment variables, and the `fetch_flatfile.js` helper for pulling historical data from Massive's S3 endpoint.
 
 **One-time setup:**
 

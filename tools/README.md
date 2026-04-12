@@ -24,11 +24,13 @@ node tools/mock_server.js
 
 ### Replay mode
 
-Replays historical data from a Massive flat file (gzipped or plain NDJSON),
-preserving real inter-event timing:
+Replays historical data from a Massive flat file (gzipped or plain CSV or
+NDJSON), preserving real inter-event timing. Format is auto-detected from
+the first line; CSV field names (`ticker`, `price`, `sip_timestamp`, ...)
+are normalised to the wire format (`sym`, `p`, `t`, ...).
 
 ```bash
-MOCK_REPLAY_FILE=data/stocks_trades_2026-04-10.json.gz node tools/mock_server.js
+MOCK_REPLAY_FILE=data/us_stocks_sip_trades_v1_2026-04-10.csv.gz node tools/mock_server.js
 ```
 
 Events are sent at their original wall-clock rate. Use `MOCK_REPLAY_SPEED`
@@ -53,6 +55,7 @@ file ends, playback loops by default (`MOCK_REPLAY_LOOP=false` to stop).
 | `MOCK_REPLAY_FILE`  | *(empty)*    | Path to flat file; enables replay  |
 | `MOCK_REPLAY_SPEED` | `1`          | Playback speed multiplier          |
 | `MOCK_REPLAY_LOOP`  | `true`       | Loop when file ends                |
+| `MOCK_CHUNK_SIZE`   | `32`         | Max events per ws frame in replay  |
 
 ### Connecting from the CLI
 

@@ -66,4 +66,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cli.addArgs(args);
     const run_step = b.step("run-cli", "Build and run the native CLI: zig build run-cli -- T.AAPL T.MSFT");
     run_step.dependOn(&run_cli.step);
+
+    // ------------------------------------------------------------------
+    // Unit tests — run natively. Add each file that contains test blocks.
+    // ------------------------------------------------------------------
+    const test_step = b.step("test", "Run unit tests");
+    const test_sources = [_][]const u8{
+        "src/massive_protocol.zig",
+        "src/massive_rtd.zig",
+    };
+    for (test_sources) |src| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = native_target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 }
