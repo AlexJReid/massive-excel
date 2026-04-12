@@ -185,13 +185,24 @@ const Handler = struct {
     /// race the main thread freeing state from under it.
     terminating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Protects `topics` and `markets`. Per-market state has its own mutex
-    /// inside MarketConn.
+    /// Protects `topics`, `markets`, and `last_notify_ms`. Per-market state
+    /// has its own mutex inside MarketConn.
     mu: std.Thread.Mutex = .{},
     topics: std.AutoHashMapUnmanaged(rtd.LONG, TopicState) = .empty,
+    /// Unix-ms timestamp of the last `notifyExcel()` call. Used to throttle
+    /// COM notifications so we don't overwhelm Excel's STA message pump
+    /// under high-speed replay or firehose conditions. Protected by `mu`.
+    last_notify_ms: i64 = 0,
     /// Active connections keyed by market name. Values are heap-allocated and
     /// owned by this map.
     markets: std.StringHashMapUnmanaged(*MarketConn) = .empty,
+    /// Scratch buffer for the most recent string returned by onRefreshValue.
+    /// The framework calls SysAllocStringLen on the returned pointer AFTER
+    /// we release self.mu, so a bare borrow into TopicState.value would race
+    /// the worker thread freeing and replacing that buffer. This scratch
+    /// copy is safe because onRefreshValue is only called from the main
+    /// Excel thread (inside RefreshData) and is never re-entered.
+    refresh_str_scratch: [4096]u16 = undefined,
 
     pub fn onStart(self: *Handler, ctx: *rtd.RtdContext) void {
         const cfg = config.load();
@@ -326,7 +337,15 @@ const Handler = struct {
         defer self.mu.unlock();
 
         const state = self.topics.getPtr(topic_id) orelse return rtd.RtdValue.na;
-        return state.value.toRtdValue();
+        return switch (state.value) {
+            .string => |s| blk: {
+                // Copy into scratch so the pointer survives after mu is released.
+                const len = @min(s.len, self.refresh_str_scratch.len);
+                @memcpy(self.refresh_str_scratch[0..len], s[0..len]);
+                break :blk .{ .string = self.refresh_str_scratch[0..len] };
+            },
+            else => state.value.toRtdValue(),
+        };
     }
 
     pub fn onTerminate(self: *Handler, _: *rtd.RtdContext) void {
@@ -728,7 +747,17 @@ fn handleDataMessage(mc: *MarketConn, payload: []const u8) !void {
         }
     }
 
-    if (any_dirty and !handler.terminating.load(.acquire)) ctx.notifyExcel();
+    // Throttle UpdateNotify to at most once per 100ms. The COM call marshals
+    // across threads into Excel's STA; flooding it at firehose rates backs up
+    // the message pump and eventually crashes Excel. Excel's own RTD throttle
+    // interval (default 2s) means extra notifications are redundant anyway.
+    if (any_dirty and !handler.terminating.load(.acquire)) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - handler.last_notify_ms >= 100) {
+            handler.last_notify_ms = now_ms;
+            ctx.notifyExcel();
+        }
+    }
 
     // Update the dispatch-time EWMA and, if it's trending high, warn the
     // user that they're in danger of being disconnected for slow consumption.

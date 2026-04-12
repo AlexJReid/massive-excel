@@ -29,7 +29,8 @@ const PORT = parseInt(process.env.MOCK_PORT || '8443', 10);
 const API_KEY = process.env.MOCK_API_KEY || 'test-key';
 const TICK_MS = parseInt(process.env.MOCK_TICK_MS || '500', 10);
 
-// Replay mode — set MOCK_REPLAY_FILE to a flat file (.json.gz or .json).
+// Replay mode — set MOCK_REPLAY_FILE to a flat file (.csv.gz, .csv, .json.gz, or .json).
+// Massive flat files are CSV; NDJSON is also accepted for hand-crafted fixtures.
 const REPLAY_FILE = process.env.MOCK_REPLAY_FILE || '';
 const REPLAY_SPEED = parseFloat(process.env.MOCK_REPLAY_SPEED || '1');
 const REPLAY_LOOP = (process.env.MOCK_REPLAY_LOOP || 'true') !== 'false';
@@ -121,12 +122,64 @@ function makeEvent(channel) {
 }
 
 // ---------------------------------------------------------------------------
-// Replay file loader — reads gzipped or plain NDJSON into a sorted array.
+// Replay file loader — reads gzipped or plain CSV/NDJSON into a sorted array.
 // ---------------------------------------------------------------------------
 
 // Each entry: { t: <timestamp ms>, ev: <string>, sym: <string>, ...rest }
 // Sorted by t ascending. Events with no `t` field are dropped.
 let replayEvents = null; // null = synthetic mode, [] = replay mode
+
+// Detect format from the first non-empty line: if it starts with '{' or '['
+// it's NDJSON, otherwise CSV (with a header row).
+function detectFormat(firstLine) {
+    const ch = firstLine.trim()[0];
+    return (ch === '{' || ch === '[') ? 'ndjson' : 'csv';
+}
+
+// Minimal CSV line splitter — handles double-quoted fields containing commas.
+function splitCSV(line) {
+    const fields = [];
+    let i = 0;
+    while (i <= line.length) {
+        if (i < line.length && line[i] === '"') {
+            // Quoted field — find matching close quote.
+            let j = i + 1;
+            let val = '';
+            while (j < line.length) {
+                if (line[j] === '"') {
+                    if (j + 1 < line.length && line[j + 1] === '"') {
+                        val += '"';
+                        j += 2;
+                    } else {
+                        j++; // past closing quote
+                        break;
+                    }
+                } else {
+                    val += line[j];
+                    j++;
+                }
+            }
+            fields.push(val);
+            i = j + 1; // skip comma
+        } else {
+            const comma = line.indexOf(',', i);
+            if (comma === -1) {
+                fields.push(line.slice(i));
+                break;
+            }
+            fields.push(line.slice(i, comma));
+            i = comma + 1;
+        }
+    }
+    return fields;
+}
+
+// Convert a string value to a number if it looks numeric, otherwise keep as string.
+function autoType(val) {
+    if (val === '') return val;
+    const n = Number(val);
+    return Number.isFinite(n) ? n : val;
+}
 
 async function loadReplayFile(filepath) {
     log(`loading replay file: ${filepath}`);
@@ -138,16 +191,74 @@ async function loadReplayFile(filepath) {
 
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
     let lineNo = 0;
+    let format = null;
+    let csvHeaders = null;
+
     for await (const line of rl) {
         lineNo++;
-        if (!line.trim()) continue;
-        try {
-            const obj = JSON.parse(line);
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        // Detect format from first non-empty line.
+        if (!format) {
+            format = detectFormat(trimmed);
+            log(`  format: ${format}`);
+            if (format === 'csv') {
+                csvHeaders = splitCSV(trimmed);
+                continue; // header row consumed
+            }
+        }
+
+        if (format === 'csv') {
+            const values = splitCSV(trimmed);
+            const obj = {};
+            for (let i = 0; i < csvHeaders.length && i < values.length; i++) {
+                obj[csvHeaders[i]] = autoType(values[i]);
+            }
+            // Massive CSV uses "timestamp" or "sip_timestamp" (nanoseconds) for the
+            // time field. Normalise to "t" in milliseconds for the replay cursor.
+            if (obj.t == null) {
+                const ns = obj.sip_timestamp || obj.participant_timestamp || obj.window_start || obj.timestamp;
+                if (ns != null) {
+                    obj.t = Math.floor(ns / 1e6); // nanoseconds → ms
+                }
+            }
+            // Infer ev from the prefix if not present — Massive CSVs for
+            // trades_v1 don't carry an "ev" column; the event type is implied
+            // by the file (trades → "T", quotes → "Q", minute_aggs → "AM").
+            if (!obj.ev) {
+                const lower = filepath.toLowerCase();
+                if (lower.includes('trades')) obj.ev = 'T';
+                else if (lower.includes('quotes')) obj.ev = 'Q';
+                else if (lower.includes('minute_aggs')) obj.ev = 'AM';
+                else if (lower.includes('second_aggs')) obj.ev = 'A';
+            }
+            // Normalise symbol field: Massive CSV uses "ticker", wire uses "sym".
+            if (!obj.sym && obj.ticker) {
+                obj.sym = obj.ticker;
+            }
+            // Normalise field names: Massive CSV uses long names, wire uses short.
+            if (obj.price != null && obj.p == null) obj.p = obj.price;
+            if (obj.size != null && obj.s == null) obj.s = obj.size;
+            if (obj.open != null && obj.o == null) obj.o = obj.open;
+            if (obj.close != null && obj.c == null) obj.c = obj.close;
+            if (obj.high != null && obj.h == null) obj.h = obj.high;
+            if (obj.low != null && obj.l == null) obj.l = obj.low;
+            if (obj.volume != null && obj.v == null) obj.v = obj.volume;
+
             if (obj.t != null && obj.ev && obj.sym) {
                 events.push(obj);
             }
-        } catch (e) {
-            if (lineNo <= 3) log(`  warning: bad JSON on line ${lineNo}`);
+        } else {
+            // NDJSON
+            try {
+                const obj = JSON.parse(trimmed);
+                if (obj.t != null && obj.ev && obj.sym) {
+                    events.push(obj);
+                }
+            } catch (e) {
+                if (lineNo <= 3) log(`  warning: bad JSON on line ${lineNo}`);
+            }
         }
     }
     events.sort((a, b) => a.t - b.t);
@@ -365,7 +476,7 @@ async function main() {
         } else {
             log(`mode: SYNTHETIC (tick ${TICK_MS}ms)`);
         }
-        log('try: zig build run-cli -Dmassive_host=localhost -Dmassive_port=' + PORT + ' -Dmassive_insecure=true -- T.AAPL T.MSFT');
+        log('try: zig build run-cli -Dmassive_host=localhost -Dmassive_port=' + PORT + ' -Dmassive_insecure=true -- AM.AAPL AM.MSFT');
     });
 }
 

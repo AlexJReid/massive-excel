@@ -35,7 +35,8 @@
 //   MASSIVE_S3_BUCKET      — override bucket  (default: flatfiles)
 //
 // Output defaults to data/<prefix-with-slashes-replaced>_<date>.csv.gz.
-// The file is gzipped CSV and can be fed to mock_server.js via MOCK_REPLAY_FILE.
+// The file is gzipped CSV. Feed it to mock_server.js via MOCK_REPLAY_FILE —
+// the loader auto-detects CSV vs NDJSON and normalises field names to the wire format.
 
 const https = require('https');
 const crypto = require('crypto');

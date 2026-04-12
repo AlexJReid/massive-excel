@@ -17,7 +17,9 @@ const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
 /// Max single-frame payload we'll accept (or emit).
-const max_payload = 64 * 1024;
+/// 512 KiB handles large batched JSON arrays from high-speed replays
+/// (e.g. minute aggs with hundreds of symbols per timestamp).
+const max_payload = 512 * 1024;
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -299,7 +301,13 @@ pub const Client = struct {
     /// Returns a heap-allocated payload - caller owns.
     pub fn readMessage(self: *Client, alloc: std.mem.Allocator) !Message {
         while (true) {
-            const frame = try self.readRawFrame(alloc);
+            const frame = self.readRawFrame(alloc) catch |err| switch (err) {
+                // Oversized frame was already drained — skip it and keep
+                // reading. This keeps the session alive under firehose
+                // conditions instead of forcing a reconnect.
+                error.PayloadTooLarge => continue,
+                else => return err,
+            };
             switch (frame.opcode) {
                 .text, .binary => return frame,
                 .ping => {
@@ -355,6 +363,18 @@ pub const Client = struct {
         try self.sendFrame(.ping, payload);
     }
 
+    /// Consume and discard `n` bytes from the TLS reader. Used to drain
+    /// oversized WebSocket frames so the stream stays in sync for the next
+    /// frame header.
+    fn drainBytes(self: *Client, r: *Reader, n: usize) !void {
+        _ = self;
+        var remaining = n;
+        while (remaining > 0) {
+            const chunk = try r.take(remaining);
+            remaining -= chunk.len;
+        }
+    }
+
     fn readRawFrame(self: *Client, alloc: std.mem.Allocator) !Message {
         const r = self.tlsReader();
 
@@ -374,13 +394,23 @@ pub const Client = struct {
             126 => try r.takeInt(u16, .big),
             127 => blk: {
                 const l = try r.takeInt(u64, .big);
-                if (l > max_payload) return error.PayloadTooLarge;
+                if (l > max_payload) {
+                    // Drain the oversized frame so the stream stays in sync,
+                    // then signal the caller to skip this message.
+                    try self.drainBytes(r, @intCast(l));
+                    self.last_recv_ms = std.time.milliTimestamp();
+                    return error.PayloadTooLarge;
+                }
                 break :blk @intCast(l);
             },
             else => len7,
         };
 
-        if (len > max_payload) return error.PayloadTooLarge;
+        if (len > max_payload) {
+            try self.drainBytes(r, len);
+            self.last_recv_ms = std.time.milliTimestamp();
+            return error.PayloadTooLarge;
+        }
 
         const payload = try alloc.alloc(u8, len);
         errdefer alloc.free(payload);
