@@ -76,13 +76,13 @@ pub fn build(b: *std.Build) void {
         "src/massive_rtd.zig",
     };
     for (test_sources) |src| {
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(src),
-                .target = native_target,
-                .optimize = optimize,
-            }),
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = native_target,
+            .optimize = optimize,
         });
+        test_mod.link_libc = true;
+        const t = b.addTest(.{ .root_module = test_mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }
