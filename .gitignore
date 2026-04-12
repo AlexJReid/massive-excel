@@ -8,3 +8,4 @@ node_modules
 package-lock.json
 tools/cert.pem
 tools/key.pem
+data/

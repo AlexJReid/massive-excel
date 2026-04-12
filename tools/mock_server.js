@@ -14,6 +14,8 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const zlib = require('zlib');
+const readline = require('readline');
 
 let WebSocketServer;
 try {
@@ -26,6 +28,11 @@ try {
 const PORT = parseInt(process.env.MOCK_PORT || '8443', 10);
 const API_KEY = process.env.MOCK_API_KEY || 'test-key';
 const TICK_MS = parseInt(process.env.MOCK_TICK_MS || '500', 10);
+
+// Replay mode — set MOCK_REPLAY_FILE to a flat file (.json.gz or .json).
+const REPLAY_FILE = process.env.MOCK_REPLAY_FILE || '';
+const REPLAY_SPEED = parseFloat(process.env.MOCK_REPLAY_SPEED || '1');
+const REPLAY_LOOP = (process.env.MOCK_REPLAY_LOOP || 'true') !== 'false';
 
 const certPath = path.join(__dirname, 'cert.pem');
 const keyPath = path.join(__dirname, 'key.pem');
@@ -114,6 +121,119 @@ function makeEvent(channel) {
 }
 
 // ---------------------------------------------------------------------------
+// Replay file loader — reads gzipped or plain NDJSON into a sorted array.
+// ---------------------------------------------------------------------------
+
+// Each entry: { t: <timestamp ms>, ev: <string>, sym: <string>, ...rest }
+// Sorted by t ascending. Events with no `t` field are dropped.
+let replayEvents = null; // null = synthetic mode, [] = replay mode
+
+async function loadReplayFile(filepath) {
+    log(`loading replay file: ${filepath}`);
+    const events = [];
+    const raw = fs.createReadStream(filepath);
+    const stream = filepath.endsWith('.gz')
+        ? raw.pipe(zlib.createGunzip())
+        : raw;
+
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    let lineNo = 0;
+    for await (const line of rl) {
+        lineNo++;
+        if (!line.trim()) continue;
+        try {
+            const obj = JSON.parse(line);
+            if (obj.t != null && obj.ev && obj.sym) {
+                events.push(obj);
+            }
+        } catch (e) {
+            if (lineNo <= 3) log(`  warning: bad JSON on line ${lineNo}`);
+        }
+    }
+    events.sort((a, b) => a.t - b.t);
+    log(`  loaded ${events.length} events`);
+    if (events.length > 0) {
+        const first = new Date(events[0].t).toISOString();
+        const last = new Date(events[events.length - 1].t).toISOString();
+        log(`  time range: ${first} → ${last}`);
+    }
+    return events;
+}
+
+// Replay cursor per connection — walks through replayEvents respecting timing.
+function createReplayCursor(ws, getSubs) {
+    let idx = 0;
+    let timer = null;
+    let wallStart = null;  // wall clock time when replay started
+    let dataStart = null;  // timestamp of first event in the file
+
+    function stop() {
+        if (timer) { clearTimeout(timer); timer = null; }
+    }
+
+    function scheduleNext() {
+        if (ws.readyState !== ws.OPEN) { stop(); return; }
+        if (replayEvents.length === 0) return;
+
+        // Find the next event that matches a subscribed channel.
+        const subs = getSubs();
+        while (idx < replayEvents.length) {
+            const evt = replayEvents[idx];
+            const channel = `${evt.ev}.${evt.sym}`;
+            if (subs.has(channel)) break;
+            idx++;
+        }
+
+        if (idx >= replayEvents.length) {
+            if (REPLAY_LOOP) {
+                log(`  replay: looping`);
+                idx = 0;
+                wallStart = Date.now();
+                dataStart = replayEvents[0].t;
+                scheduleNext();
+            } else {
+                log(`  replay: end of file`);
+            }
+            return;
+        }
+
+        const evt = replayEvents[idx];
+        if (wallStart === null) {
+            wallStart = Date.now();
+            dataStart = evt.t;
+        }
+
+        // How long after the replay start should this event fire?
+        const dataElapsed = evt.t - dataStart;
+        const wallTarget = REPLAY_SPEED > 0
+            ? wallStart + dataElapsed / REPLAY_SPEED
+            : Date.now(); // speed=0: firehose
+        const delay = Math.max(0, wallTarget - Date.now());
+
+        timer = setTimeout(() => {
+            if (ws.readyState !== ws.OPEN) return;
+            const subs = getSubs();
+
+            // Batch all events at the same timestamp (within 1ms).
+            const batch = [];
+            const batchEnd = evt.t + 1;
+            while (idx < replayEvents.length && replayEvents[idx].t < batchEnd) {
+                const e = replayEvents[idx];
+                const ch = `${e.ev}.${e.sym}`;
+                if (subs.has(ch)) batch.push(e);
+                idx++;
+            }
+            if (batch.length > 0) {
+                ws.send(JSON.stringify(batch));
+            }
+            scheduleNext();
+        }, delay);
+    }
+
+    return { start: scheduleNext, stop };
+}
+
+// ---------------------------------------------------------------------------
 // Connection handling
 // ---------------------------------------------------------------------------
 
@@ -131,18 +251,25 @@ wss.on('connection', (ws, req) => {
         message: 'Connected Successfully',
     }]));
 
-    // 2. Per-connection tick driver.
-    const tick = setInterval(() => {
-        if (!authed || subs.size === 0) return;
-        const batch = [];
-        for (const ch of subs) {
-            const evt = makeEvent(ch);
-            if (evt) batch.push(evt);
-        }
-        if (batch.length > 0) {
-            ws.send(JSON.stringify(batch));
-        }
-    }, TICK_MS);
+    // 2. Per-connection tick driver — synthetic or replay.
+    let tick = null;
+    let cursor = null;
+
+    if (replayEvents) {
+        cursor = createReplayCursor(ws, () => subs);
+    } else {
+        tick = setInterval(() => {
+            if (!authed || subs.size === 0) return;
+            const batch = [];
+            for (const ch of subs) {
+                const evt = makeEvent(ch);
+                if (evt) batch.push(evt);
+            }
+            if (batch.length > 0) {
+                ws.send(JSON.stringify(batch));
+            }
+        }, TICK_MS);
+    }
 
     ws.on('message', (raw) => {
         let msg;
@@ -189,6 +316,8 @@ wss.on('connection', (ws, req) => {
                 message: `subscribed to: ${channels.join(',')}`,
             }]));
             log(`  ${peer} SUB`, Array.from(subs));
+            // Kick off replay cursor if this is the first subscription.
+            if (cursor) cursor.start();
             return;
         }
 
@@ -208,7 +337,8 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', () => {
-        clearInterval(tick);
+        if (tick) clearInterval(tick);
+        if (cursor) cursor.stop();
         log(`CLOSE    ${peer}`);
     });
 
@@ -217,9 +347,29 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-    log(`mock_server listening on wss://0.0.0.0:${PORT}/`);
-    log(`expected API key: "${API_KEY}"`);
-    log(`tick interval: ${TICK_MS}ms`);
-    log('try: zig build run-cli -Dmassive_host=localhost -Dmassive_port=' + PORT + ' -Dmassive_insecure=true -- T.AAPL T.MSFT');
+async function main() {
+    if (REPLAY_FILE) {
+        replayEvents = await loadReplayFile(REPLAY_FILE);
+        if (replayEvents.length === 0) {
+            console.error('ERROR: replay file is empty or has no valid events');
+            process.exit(1);
+        }
+    }
+
+    server.listen(PORT, '0.0.0.0', () => {
+        log(`mock_server listening on wss://0.0.0.0:${PORT}/`);
+        log(`expected API key: "${API_KEY}"`);
+        if (replayEvents) {
+            log(`mode: REPLAY from ${REPLAY_FILE}`);
+            log(`  speed: ${REPLAY_SPEED}x, loop: ${REPLAY_LOOP}`);
+        } else {
+            log(`mode: SYNTHETIC (tick ${TICK_MS}ms)`);
+        }
+        log('try: zig build run-cli -Dmassive_host=localhost -Dmassive_port=' + PORT + ' -Dmassive_insecure=true -- T.AAPL T.MSFT');
+    });
+}
+
+main().catch((err) => {
+    console.error(`ERROR: ${err.message}`);
+    process.exit(1);
 });
