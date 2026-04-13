@@ -114,7 +114,7 @@ const MarketConn = struct {
     /// dispatch into the topics map and Excel notification.
     handler: *Handler,
 
-    // --- Worker-thread-only state (not touched by Handler callbacks) ---
+    // --- workerMain-only state ---
     worker_thread: ?std.Thread = null,
     /// Did the most recent session reach the read loop? Checked at the top of
     /// the worker loop to decide whether to reset `reconnect_attempts`.
@@ -122,20 +122,34 @@ const MarketConn = struct {
     /// Consecutive failed sessions since the last successful auth. Feeds the
     /// reconnect backoff.
     reconnect_attempts: u32 = 0,
-    /// PRNG for jittering the reconnect delay. Seeded once in workerMain
-    /// before the loop runs.
+    /// PRNG for jittering the reconnect delay. Seeded once in workerMain.
     jitter_rng: std.Random.DefaultPrng = undefined,
-    /// Exponentially-weighted moving average of per-frame dispatch time, in
-    /// milliseconds. Used to detect "dispatch is falling behind" without
-    /// spamming the log on a single slow frame. Updated at the bottom of
-    /// handleDataMessage, worker-thread-only.
+    /// Exponentially-weighted moving average of per-frame dispatch time (ms).
+    /// Updated inside handleDataMessage on the reader thread.
     dispatch_ewma_ms: u64 = 0,
-    /// Unix-ms timestamp of the last "dispatch lagging" warning we logged.
-    /// Rate-limits the warning to at most once per 10s per market.
+    /// Unix-ms timestamp of the last "dispatch lagging" warning. Rate-limits
+    /// the warning to once per 10s per market.
     last_lag_warn_ms: i64 = 0,
+    /// Raw socket handle for the session's TLS connection, or -1.
+    /// Published atomically by the reader thread after connect, cleared
+    /// before close. onTerminate calls shutdown(SHUT_RDWR) on it to unblock
+    /// any in-flight recv so join() returns promptly.
+    live_socket: std.atomic.Value(i64) = std.atomic.Value(i64).init(-1),
+
+    // --- Shared between reader and writer threads ---
+    /// Serialises all writes to ws.Client (sendText, sendPing, sendClose,
+    /// sendPong). The reader thread takes this when it needs to reply to a
+    /// server ping; the writer thread takes it for everything else.
+    write_mu: std.Thread.Mutex = .{},
+    /// Writer thread handle, valid only during an active session.
+    writer_thread: ?std.Thread = null,
 
     // --- Protected by `mu` ---
     mu: std.Thread.Mutex = .{},
+    /// Signalled by onConnect/onDisconnect after appending to pending_sub or
+    /// pending_unsub, so the writer thread wakes immediately instead of
+    /// waiting for its 1s timedWait to expire.
+    work_cond: std.Thread.Condition = .{},
     /// Channel -> list of topic_ids subscribed to that channel. The list is
     /// both the dispatch index (read on each frame to route an incoming
     /// "<ev>.<sym>" to the cells that care) and the refcount (number of live
@@ -143,14 +157,14 @@ const MarketConn = struct {
     /// empties we remove the entry and queue an unsubscribe. Keys are owned
     /// by this map.
     channels: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(rtd.LONG)) = .empty,
-    /// Queued subscribe/unsubscribe actions for the worker thread to flush.
-    /// Strings in these lists are owned - the worker frees them after flushing.
+    /// Queued subscribe/unsubscribe actions for the writer thread to flush.
+    /// Strings in these lists are owned - the writer frees them after flushing.
     pending_sub: std.ArrayListUnmanaged([]u8) = .empty,
     pending_unsub: std.ArrayListUnmanaged([]u8) = .empty,
 
     /// Scratch arena reset once per incoming WS frame - owns the JSON parse
     /// tree and any transient stringification buffers for that frame.
-    /// Only touched from the worker thread inside handleDataMessage.
+    /// Only touched from the reader thread inside handleDataMessage.
     frame_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator),
 
     fn deinit(self: *MarketConn) void {
@@ -286,6 +300,7 @@ const Handler = struct {
         };
         const queued = gpa.dupe(u8, channel) catch return;
         mc.pending_sub.append(gpa, queued) catch gpa.free(queued);
+        mc.work_cond.signal();
     }
 
     pub fn onConnectBatch(_: *Handler, _: *rtd.RtdContext, _: []const rtd.LONG) void {
@@ -324,6 +339,7 @@ const Handler = struct {
                     list.deinit(gpa);
                     _ = mc.channels.remove(channel);
                     mc.pending_unsub.append(gpa, owned_key) catch gpa.free(owned_key);
+                    mc.work_cond.signal();
                 }
             }
         }
@@ -366,12 +382,22 @@ const Handler = struct {
         while (mit.next()) |e| market_list.append(gpa, e.value_ptr.*) catch {};
         self.mu.unlock();
 
-        // Let workers exit on their own. The read loop polls with a 2s
-        // timeout and re-checks `running` between polls, so every worker
-        // exits within ~2s without us force-closing the socket. We do NOT
-        // closesocket() from here: on Windows, closing a socket while
-        // another thread is inside WSAPoll on it is undefined behavior and
-        // was observed to crash Excel during teardown.
+        // Kick each reader's socket so any in-flight recv returns immediately.
+        // The reader thread still owns the close (via defer in workerSession);
+        // shutdown just unblocks the syscall so join() returns promptly.
+        // We do NOT closesocket() from here: on Windows, closing a socket
+        // while another thread is inside a recv on it is undefined behavior
+        // and was observed to crash Excel during teardown.
+        //
+        // The writer thread wakes from its timedWait within ≤1s and exits
+        // when it observes running=false; no extra signal needed.
+        for (market_list.items) |mc| {
+            kickLiveSocket(mc);
+        }
+
+        // Only join the supervisor (worker_thread). It joins writer_thread
+        // itself inside workerSession's defer before returning, so touching
+        // writer_thread here would be a double-join.
         for (market_list.items) |mc| {
             if (mc.worker_thread) |t| {
                 t.join();
@@ -420,7 +446,7 @@ const Handler = struct {
             return null;
         };
 
-        // Spawn the worker thread. The thread captures the MarketConn pointer
+        // Spawn the supervisor thread. It captures the MarketConn pointer
         // directly; it's stable for the remainder of the Excel session.
         mc.worker_thread = std.Thread.spawn(.{}, workerMain, .{mc}) catch |err| {
             rtd.debugLog("massive_rtd: failed to spawn worker for {s}: {s}", .{ market, @errorName(err) });
@@ -434,6 +460,37 @@ const Handler = struct {
         return mc;
     }
 };
+
+/// `net.Stream.Handle` is `i32` on posix and `*SOCKET__opaque` on Windows;
+/// both round-trip through i64 losslessly. -1 is the "no socket" sentinel.
+fn socketHandleToI64(h: std.net.Stream.Handle) i64 {
+    return if (@import("builtin").os.tag == .windows)
+        @as(i64, @bitCast(@as(u64, @intFromPtr(h))))
+    else
+        @as(i64, h);
+}
+
+fn i64ToSocketHandle(v: i64) std.net.Stream.Handle {
+    return if (@import("builtin").os.tag == .windows)
+        @as(std.net.Stream.Handle, @ptrFromInt(@as(usize, @bitCast(@as(isize, @intCast(v))))))
+    else
+        @as(std.net.Stream.Handle, @intCast(v));
+}
+
+/// Shutdown both directions of the socket to unblock any in-flight recv on
+/// the reader thread so join() returns promptly. The reader thread still
+/// owns the close via client.deinit.
+fn kickSocket(h: std.net.Stream.Handle) void {
+    std.posix.shutdown(h, .both) catch {};
+}
+
+/// Read live_socket atomically and kick it only if a session is active.
+/// Safe to call from any thread at any point; guards against the -1 sentinel
+/// that means "no session" (i64ToSocketHandle(-1) is undefined on Windows).
+fn kickLiveSocket(mc: *MarketConn) void {
+    const v = mc.live_socket.load(.acquire);
+    if (v != -1) kickSocket(i64ToSocketHandle(v));
+}
 
 /// Known Massive market names. Matches the documented set of per-market WS
 /// paths: stocks, options, forex, crypto, indices, futures.
@@ -541,12 +598,28 @@ fn workerSession(mc: *MarketConn) !void {
     const client = try ws.Client.connect(gpa, cfg.host, cfg.port, path, bundle, .{
         .insecure_skip_verify = cfg.insecure,
     });
-    defer client.deinit();
+    // Publish the socket so onTerminate can kick it (shutdown SHUT_RDWR) and
+    // unblock the reader's recv so join() returns promptly.
+    mc.live_socket.store(socketHandleToI64(client.stream.handle), .release);
+    defer {
+        // If onTerminate kicked the socket, the TLS layer is in an undefined
+        // state. Skip the graceful close and go straight to freeing; the server
+        // observes the RST and cleans up its end.
+        const terminating = mc.handler.terminating.load(.acquire);
+        mc.live_socket.store(-1, .release);
+        if (!terminating) {
+            mc.write_mu.lock();
+            client.sendClose(1000) catch {};
+            client.tls_client.end() catch {};
+            mc.write_mu.unlock();
+        }
+        client.stream.close();
+        client.stream_closed = true;
+        client.closed = true;
+        client.deinit();
+    }
 
-    // Auth handshake. The config is cached for the life of the process — to
-    // rotate keys, update $MASSIVE_API_KEY or config.json and restart Excel.
-    // Access to a given market is gated by the API key's plan; unauthorized
-    // markets fail auth.
+    // Auth handshake.
     const api_key = cfg.api_key orelse {
         rtd.debugLog("massive_rtd: [{s}] no API key configured - set MASSIVE_API_KEY or add api_key to config.json", .{mc.name});
         return error.NoApiKey;
@@ -555,55 +628,98 @@ fn workerSession(mc: *MarketConn) !void {
     rtd.debugLog("massive_rtd: [{s}] authenticated", .{mc.name});
     mc.session_was_authed = true;
 
-    // Replay any channels we already have (after a reconnect).
+    // Re-subscribe any channels we already hold (after a reconnect).
     try flushInitialSubscribes(mc, client);
 
-    // Read loop - poll for incoming messages AND flush pending sub/unsub.
-    //
-    // We use a short poll timeout (readMessageTimeout) so that queued
-    // sub/unsub actions get flushed promptly even during off-hours when the
-    // server isn't pushing any frames. Without this, a fresh subscribe would
-    // sit in `pending_sub` until the next inbound frame, causing visible
-    // latency on low-traffic feeds. Every `ping_interval_ms` we also send a
-    // client-initiated WS ping to keep NAT happy and surface dead connections.
-    //
-    // `recv_deadline_ms` is our liveness check: if nothing has arrived from
-    // the server in that long - no data, no pong, nothing - we declare the
-    // socket half-open and force a reconnect. Without this, a silently-dead
-    // TCP connection would sit there until the OS keepalive kicked in, which
-    // on macOS/Windows can take minutes and leaves every cell stale.
-    const poll_timeout_ms: i32 = 2000;
-    const ping_interval_ms: i64 = 20_000;
-    const recv_deadline_ms: i64 = 45_000;
-    var last_ping_ms = std.time.milliTimestamp();
+    // Spawn the writer thread. It owns all outbound sends from this point:
+    // flushPending (subs/unsubs), pings, and recv-deadline enforcement.
+    // The reader thread below only writes when replying to a server ping
+    // (sendPong), taking write_mu for that.
+    mc.writer_thread = try std.Thread.spawn(.{}, writerThread, .{ mc, client });
+    defer {
+        // Signal the writer to wake and check running=false, then join.
+        mc.mu.lock();
+        mc.work_cond.signal();
+        mc.mu.unlock();
+        if (mc.writer_thread) |t| t.join();
+        mc.writer_thread = null;
+    }
 
+    // Reader loop: block on readMessage, dispatch, repeat. No polling, no
+    // timeouts, no platform-specific tricks. The writer thread handles
+    // everything that needs to run on a schedule.
     while (mc.handler.running.load(.acquire)) {
-        try flushPending(mc, client);
-
-        const now_ms = std.time.milliTimestamp();
-        if (now_ms - client.last_recv_ms >= recv_deadline_ms) {
-            rtd.debugLog("massive_rtd: [{s}] recv deadline ({d}ms) exceeded - forcing reconnect", .{ mc.name, recv_deadline_ms });
-            return error.RecvDeadlineExceeded;
-        }
-        if (now_ms - last_ping_ms >= ping_interval_ms) {
-            client.sendPing("") catch |err| {
-                rtd.debugLog("massive_rtd: [{s}] ping failed: {s}", .{ mc.name, @errorName(err) });
-                return err;
-            };
-            last_ping_ms = now_ms;
-        }
-
-        const msg = client.readMessageTimeout(gpa, poll_timeout_ms) catch |err| switch (err) {
-            error.Timeout => continue,
-            error.ConnectionClosed => return error.ConnectionClosed,
-            else => return err,
+        const msg = client.readMessage(gpa) catch |err| {
+            if (err != error.ConnectionClosed) {
+                rtd.debugLog("massive_rtd: [{s}] readMessage err: {s}", .{ mc.name, @errorName(err) });
+            }
+            return err;
         };
         defer gpa.free(msg.payload);
+
+        // Server pings: reply under write_mu so we don't race the writer.
+        if (msg.opcode == .ping) {
+            mc.write_mu.lock();
+            client.sendFrame(.pong, msg.payload) catch {};
+            mc.write_mu.unlock();
+            continue;
+        }
 
         handleDataMessage(mc, msg.payload) catch |err| {
             rtd.debugLog("massive_rtd: [{s}] handle error: {s}", .{ mc.name, @errorName(err) });
         };
     }
+}
+
+/// Writer thread: runs for the lifetime of one session alongside the reader.
+/// Owns all outbound sends except pong replies (which the reader sends under
+/// write_mu). Sleeps on work_cond so it wakes immediately when onConnect or
+/// onDisconnect queues a sub/unsub, rather than spinning or polling.
+fn writerThread(mc: *MarketConn, client: *ws.Client) void {
+    const ping_interval_ms: i64 = 20_000;
+    const recv_deadline_ms: i64 = 45_000;
+    var last_ping_ms = std.time.milliTimestamp();
+
+    while (mc.handler.running.load(.acquire)) {
+        // Sleep until signalled or 1s elapses - whichever comes first.
+        mc.mu.lock();
+        mc.work_cond.timedWait(&mc.mu, 1 * std.time.ns_per_s) catch {};
+        mc.mu.unlock();
+
+        if (!mc.handler.running.load(.acquire)) break;
+        if (mc.handler.terminating.load(.acquire)) break;
+
+        // Flush any pending sub/unsub messages.
+        flushPending(mc, client) catch |err| {
+            rtd.debugLog("massive_rtd: [{s}] writer flushPending err: {s}", .{ mc.name, @errorName(err) });
+            kickLiveSocket(mc);
+            return;
+        };
+
+        const now_ms = std.time.milliTimestamp();
+
+        // Recv deadline: if the reader hasn't seen a frame in 45s the
+        // connection is silently dead. Kick the socket to unblock readMessage.
+        if (now_ms - client.last_recv_ms >= recv_deadline_ms) {
+            rtd.debugLog("massive_rtd: [{s}] recv deadline ({d}ms) exceeded - forcing reconnect", .{ mc.name, recv_deadline_ms });
+            kickLiveSocket(mc);
+            return;
+        }
+
+        // Periodic ping to keep NAT mappings warm.
+        if (now_ms - last_ping_ms >= ping_interval_ms) {
+            mc.write_mu.lock();
+            client.sendPing("") catch |err| {
+                mc.write_mu.unlock();
+                rtd.debugLog("massive_rtd: [{s}] ping failed: {s}", .{ mc.name, @errorName(err) });
+                kickLiveSocket(mc);
+                return;
+            };
+            mc.write_mu.unlock();
+            last_ping_ms = now_ms;
+        }
+    }
+    rtd.debugLog("massive_rtd: [{s}] writer thread exiting", .{mc.name});
 }
 
 fn flushInitialSubscribes(mc: *MarketConn, client: *ws.Client) !void {

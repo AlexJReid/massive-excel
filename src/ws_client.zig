@@ -57,6 +57,7 @@ pub const Client = struct {
     tls_write_buf: []u8,
 
     closed: bool = false,
+    stream_closed: bool = false,
     /// Unix-ms timestamp of the most recent inbound frame (any opcode: text,
     /// binary, pong, ping, close). Updated inside `readRawFrame`. Callers
     /// that send periodic pings should watch this field to detect a stalled
@@ -141,7 +142,10 @@ pub const Client = struct {
             self.sendClose(1000) catch {};
             self.tls_client.end() catch {};
         }
-        self.stream.close();
+        if (!self.stream_closed) {
+            self.stream.close();
+            self.stream_closed = true;
+        }
         const alloc = self.allocator;
         alloc.free(self.sock_read_buf);
         alloc.free(self.sock_write_buf);
@@ -251,7 +255,7 @@ pub const Client = struct {
         self.closed = true;
     }
 
-    fn sendFrame(self: *Client, opcode: Opcode, payload: []const u8) !void {
+    pub fn sendFrame(self: *Client, opcode: Opcode, payload: []const u8) !void {
         if (payload.len > max_payload) return error.PayloadTooLarge;
         const w = self.tlsWriter();
 
@@ -328,15 +332,23 @@ pub const Client = struct {
     /// is processed immediately; we only poll the socket when the buffers are
     /// empty, so this never blocks in the middle of a partial frame.
     pub fn readMessageTimeout(self: *Client, alloc: std.mem.Allocator, timeout_ms: i32) !Message {
-        if (!self.hasBufferedData()) {
-            var fds = [_]std.posix.pollfd{.{
-                .fd = self.stream.handle,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const n = try std.posix.poll(&fds, timeout_ms);
-            if (n == 0) return error.Timeout;
-        }
+        // Always poll, regardless of whether plaintext/ciphertext is buffered.
+        // We can't tell from buffered length alone whether a *complete* frame
+        // is ready; if only a partial frame is buffered, `readMessage` will
+        // call `take(N)` on the TLS reader, which blocks on the underlying
+        // socket with no timeout to fetch the rest. That stalls the worker
+        // for as long as it takes the next data to arrive (observed: 55s on
+        // an idle feed) and starves flushPending so queued subs don't go out.
+        // The cost of one extra poll syscall when a frame *is* fully buffered
+        // is negligible - it returns immediately because POLL.IN is set the
+        // moment any byte is readable on the socket.
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const n = try std.posix.poll(&fds, timeout_ms);
+        if (n == 0) return error.Timeout;
         return self.readMessage(alloc);
     }
 
@@ -344,7 +356,7 @@ pub const Client = struct {
     /// is already buffered in the underlying socket reader. In either case a
     /// subsequent `readMessage` call will make progress without hitting the
     /// kernel.
-    fn hasBufferedData(self: *Client) bool {
+    pub fn hasBufferedData(self: *Client) bool {
         if (self.tls_client.reader.bufferedLen() > 0) return true;
         if (self.stream_reader.interface().bufferedLen() > 0) return true;
         return false;
