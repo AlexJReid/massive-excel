@@ -372,11 +372,6 @@ const Handler = struct {
         // closesocket() from here: on Windows, closing a socket while
         // another thread is inside WSAPoll on it is undefined behavior and
         // was observed to crash Excel during teardown.
-        // Bound how long Excel waits. Healthy shutdown is ~2s (poll timeout)
-        // + ~1s (SO_SNDTIMEO on sendClose). We still join - detaching and
-        // then freeing MarketConn would be a use-after-free since the worker
-        // holds `mc` - but the socket send timeout guarantees forward
-        // progress so the join can't hang Excel.
         for (market_list.items) |mc| {
             if (mc.worker_thread) |t| {
                 rtd.debugLog("massive_rtd: [{s}] waiting for worker to close connection", .{mc.name});
