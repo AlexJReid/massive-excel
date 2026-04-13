@@ -139,13 +139,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         if (!self.closed) {
             self.sendClose(1000) catch {};
-            // tls_client.end() writes close_notify into the socket writer's
-            // buffer via output.advance() but never flushes (same contract
-            // mismatch as tls_client.writer.flush()). Without the explicit
-            // socket flush the alert never hits the wire and the peer sees
-            // a TCP FIN with no TLS shutdown, delaying session reaping.
             self.tls_client.end() catch {};
-            self.stream_writer.interface.flush() catch {};
         }
         self.stream.close();
         const alloc = self.allocator;
