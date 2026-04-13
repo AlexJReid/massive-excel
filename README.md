@@ -16,15 +16,16 @@ An Excel add-in that streams live market data from the [Massive](https://massive
 ## Quick start
 
 1. **Download the XLL.** Grab `massive_excel.xll` from the [latest GitHub release](https://github.com/AlexJReid/zigxll-connectors-wss/releases/latest) and copy it to your Windows machine. Release binaries are code-signed by **Lexvica Limited** via Azure Trusted Signing. If you build from your own fork, sign it with your own code-signing certificate.
-2. **Unblock it.** Right-click the `.xll`, Properties, tick **Unblock**, OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
+2. **You may need to unblock it it.** Right-click the `.xll`, Properties, tick **Unblock**, OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
 3. **Drop a `config.json`** in the same directory as the XLL, containing at least your API key:
 
    ```json
    {
+     "api_key": "...",
+     // optional
      "host": "socket.massive.com",
      "port": 443,
-     "path": "/stocks",
-     "api_key": "pk_live_..."
+     "path": "/stocks", // default market
    }
    ```
 
@@ -34,10 +35,10 @@ An Excel add-in that streams live market data from the [Massive](https://massive
 5. **Try a formula.** In any cell:
 
    ```
-   =MASSIVE("T.AAPL.p")
+   =MASSIVE("AM.AAPL.p")
    ```
 
-   It should start updating with live AAPL trade prices. See next section for the full topic format.
+   It should start updating with aggregate-minute AAPL trade prices. See next section for the full topic format.
 
 ## API coverage
 
