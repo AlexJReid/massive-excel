@@ -38,7 +38,7 @@ An Excel add-in that streams live market data from the [Massive](https://massive
    =MASSIVE("AM.AAPL.p")
    ```
 
-   It should start updating with aggregate-minute AAPL trade prices. See next section for the full topic format.
+   It should start updating with aggregate-minute AAPL trade prices. Depending on time of day, liquidity, aggregation, give it about a minute to update. See next section for the full topic format.
 
 ## API coverage
 
