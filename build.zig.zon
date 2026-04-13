@@ -1,6 +1,6 @@
 .{
     .name = .massive_excel,
-    .version = "0.0.9",
+    .version = "0.0.10",
     .fingerprint = 0xd80d17825b3de4b4,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
