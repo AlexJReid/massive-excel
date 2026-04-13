@@ -4,14 +4,13 @@ An Excel add-in that streams live market data from the [Massive](https://massive
 
 <img src="doc/wrapper.png" alt="A wrapper function streaming live into a cell" width="75%">
 
-
 > **Not affiliated with Massive.** An independent, unofficial client. Not endorsed by or associated with Massive. "Massive" and related marks belong to their respective owners and are used here only to describe interoperability. Your use of the Massive API is governed by Massive's own terms.
 >
-> **You need a paid Massive plan with WebSocket access.** This add-in does not source market data; it passes data from the Massive API to Excel. You supply the API key and the plan.
+> **You need a paid Massive plan with WebSocket access.** This add-in does not source market data; it is a websocket client to the Massive API that runs within Excel. You supply the API key and the plan in your `config.json`. This is covered in this doc.
 >
 > **Data only. Not financial or trading advice.** No warranty is made as to accuracy, completeness or timeliness.
 >
-> **AI-assisted.** Some of the more repetitive aspects of mirroring the Massive API in Excel were completed by AI agents. The output has been checked, but please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues) if you notice something off.
+> **AI-assisted.** Some of the more repetitive aspects of mirroring the Massive API in Excel were completed by AI agents working from the Massive docs and clients for other languages. Optimizations to the TLS and WSS client was mostly implemented by AI. The output has been checked, but please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues) if you notice something off.
 
 ## Quick start
 
@@ -29,7 +28,7 @@ An Excel add-in that streams live market data from the [Massive](https://massive
    }
    ```
 
-   The host (`socket.massive.com`, `delayed.massive.com` and so on) is plan-dependent. See the [Massive WebSocket docs](https://massive.com/docs/websocket/quickstart) for the endpoint that matches yours.
+   The host (`socket.massive.com`, `delayed.massive.com` and so on) is plan-dependent. See the [Massive WebSocket docs](https://massive.com/docs/websocket/quickstart) for the endpoint that matches whatyou have access to.
 
 4. **Load the add-in.** Double-click the `.xll`, or add it via *File, Options, Add-ins, Excel Add-ins, Browse*.
 5. **Try a formula.** In any cell:
@@ -337,7 +336,7 @@ This add-in is written in Zig, using [ZigXLL](https://github.com/AlexJReid/zigxl
 
 ### Zig
 
-Zig 0.15.1 or later. `brew install zig`, your package manager, or [ziglang.org/download](https://ziglang.org/download).
+Zig 0.15.1 or later. `brew install zig`, your package manager, or [ziglang.org/download](https://ziglang.org/download). 
 
 ### Windows SDK (only for building the XLL)
 
