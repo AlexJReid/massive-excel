@@ -9,9 +9,38 @@
 // Not supported: extensions, fragmentation across frames, large (>64 KiB) messages.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.net;
 const tls = std.crypto.tls;
 const sha1 = std.crypto.hash.Sha1;
+
+/// Set SO_SNDTIMEO on a socket so blocking sends can't hang forever. Used
+/// during shutdown to cap how long sendClose can block Excel's onTerminate.
+fn setSendTimeout(handle: std.posix.socket_t, timeout_ms: u32) !void {
+    if (builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const ms: u32 = timeout_ms;
+        const rc = ws2.setsockopt(
+            handle,
+            ws2.SOL.SOCKET,
+            ws2.SO.SNDTIMEO,
+            @as([*]const u8, @ptrCast(&ms)),
+            @sizeOf(u32),
+        );
+        if (rc == ws2.SOCKET_ERROR) return error.SetSockOptFailed;
+    } else {
+        const tv: std.posix.timeval = .{
+            .sec = @intCast(timeout_ms / 1000),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        try std.posix.setsockopt(
+            handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&tv),
+        );
+    }
+}
 
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
@@ -102,6 +131,10 @@ pub const Client = struct {
         const stream = try net.tcpConnectToHost(allocator, host, port);
         errdefer stream.close();
 
+        // Bound send latency. Without this, sendClose on a dead-ish socket
+        // during shutdown can block Excel indefinitely inside onTerminate.
+        setSendTimeout(stream.handle, 1000) catch {};
+
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
 
@@ -189,7 +222,7 @@ pub const Client = struct {
                 "Connection: Upgrade\r\n" ++
                 "Sec-WebSocket-Key: {s}\r\n" ++
                 "Sec-WebSocket-Version: 13\r\n" ++
-                "User-Agent: zigxll-massive/0.1\r\n\r\n",
+                "User-Agent: massive-excel/0.1\r\n\r\n",
             .{ path, host, key_b64 },
         );
         try self.flushChain();
