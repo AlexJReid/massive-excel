@@ -374,8 +374,10 @@ const Handler = struct {
         // was observed to crash Excel during teardown.
         for (market_list.items) |mc| {
             if (mc.worker_thread) |t| {
+                rtd.debugLog("massive_rtd: [{s}] waiting for worker to close connection", .{mc.name});
                 t.join();
                 mc.worker_thread = null;
+                rtd.debugLog("massive_rtd: [{s}] connection closed", .{mc.name});
             }
         }
 

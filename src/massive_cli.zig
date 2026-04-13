@@ -15,11 +15,29 @@
 // The API key comes from $MASSIVE_API_KEY or config.json's `api_key` field.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ws = @import("ws_client.zig");
 const protocol = @import("massive_protocol.zig");
 const config = @import("config.zig");
 
 const ca_bundle_pem = @embedFile("ca_bundle.pem");
+
+var shutdown_requested: std.atomic.Value(bool) = .init(false);
+
+fn onSigint(_: c_int) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installSigintHandler() void {
+    if (builtin.os.tag == .windows) return;
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onSigint },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
 
 pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -28,6 +46,8 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
+
+    installSigintHandler();
 
     const cfg = config.load();
 
@@ -81,11 +101,16 @@ pub fn main() !void {
     try protocol.subscribe(client, alloc, channels);
     log.info("subscribed to {d} channel(s)", .{channels.len});
 
-    // Read loop - print every event forever.
-    while (true) {
-        const msg = client.readMessage(alloc) catch |err| {
-            log.err("read failed: {s}", .{@errorName(err)});
-            return err;
+    // Read loop - print every event until SIGINT/SIGTERM. The timeout lets us
+    // notice the shutdown flag promptly; without it a quiet feed would keep us
+    // blocked in recv until the TCP timeout.
+    while (!shutdown_requested.load(.acquire)) {
+        const msg = client.readMessageTimeout(alloc, 500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => {
+                log.err("read failed: {s}", .{@errorName(err)});
+                return err;
+            },
         };
         defer alloc.free(msg.payload);
 
@@ -109,6 +134,8 @@ pub fn main() !void {
             std.debug.print("< {s}\n", .{msg.payload});
         }
     }
+
+    log.info("shutdown requested — closing connection", .{});
 }
 
 fn summarize(alloc: std.mem.Allocator, evt: std.json.Value) ![]u8 {
