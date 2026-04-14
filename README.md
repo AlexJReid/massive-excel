@@ -369,7 +369,7 @@ zig build              # XLL (zig-out/lib/standalone.xll), cross-compiled to Win
 zig build massive-cli  # CLI smoke-tester (zig-out/bin/massive-cli)
 ```
 
-By default the XLL and CLI connect to `wss://delayed.massive.com` with `/stocks` as the default market (15-minute delayed, usually free). A single build can talk to any market your API key covers; cells pick the market at runtime via the optional second RTD parameter.
+By default the XLL and CLI connect to `wss://delayed.massive.com` with `/stocks` as the default market. A single build can talk to any market your API key covers; cells pick the market at runtime via the optional second RTD parameter.
 
 Host, port, default path, TLS behaviour and API key are all set at runtime via `config.json` (see [Quick start](#quick-start) for the schema and locations). The same binary serves mock and prod. Example with all fields:
 
@@ -382,7 +382,7 @@ Host, port, default path, TLS behaviour and API key are all set at runtime via `
 }
 ```
 
-All fields are optional; missing ones fall back to compile-time defaults. See `src/config.json.example` for a template. `$MASSIVE_API_KEY` in the environment overrides `api_key` if both are set.
+**All fields bar api_key are optional; missing ones fall back to compile-time defaults.** See `src/config.json.example` for a template. `$MASSIVE_API_KEY` in the environment overrides `api_key` if both are set.
 
 The `-Dmassive_*` build flags set those compile-time defaults, for reproducible CI builds where no config file is shipped. Most users can ignore them.
 
@@ -394,11 +394,11 @@ The RTD server registers itself in `HKCU\Software\Classes` on load, so no admin 
 
 ## Smoke-test without Excel (mac/linux/windows)
 
-A native binary that exercises the TLS client, WS framing, auth handshake and JSON dispatch against a local mock server. See [`tools/README.md`](tools/README.md) for the mock server's replay mode, environment variables, and the `fetch_flatfile.js` helper for pulling historical data from Massive's S3 endpoint.
+A binary that exercises the TLS client, WS framing, auth handshake and JSON dispatch against a local mock server. See [`tools/README.md`](tools/README.md) for the mock server's replay mode, environment variables, and the `fetch_flatfile.js` helper for pulling historical data from Massive's S3 endpoint.
 
 ## Architecture
 
-Pure Zig. Most of the code is a Zig implementation of the Massive wire protocol, plus a small amount of plumbing to expose it as an RTD server COM object. ZigXLL handles the COM and XLL side.
+Pure Zig. Most of the code is a Zig implementation of the Massive wire protocol and TLS support as I didn't want to link OpenSSL. Then there's the plumbing to expose it as an RTD server COM object. ZigXLL handles the COM and XLL side.
 
 ```
             ┌──────────────────────────────────────────┐
