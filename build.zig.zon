@@ -1,0 +1,17 @@
+.{
+    .name = .massive_excel,
+    .version = "0.0.12",
+    .fingerprint = 0xd80d17825b3de4b4,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        .xll = .{
+            .url = "https://github.com/AlexJReid/zigxll/archive/refs/tags/v0.3.27.tar.gz",
+            .hash = "xll-0.3.27-rzwxcYFAGgAkKv3Qhypr2b8pf2KulxP2Cu1Bj7CKCXjM",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
