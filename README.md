@@ -14,21 +14,22 @@ This is an Excel add-in that streams live market data from the [Massive](https:/
 
 ## Quick start
 
+You need a [Massive Stocks Starter plan or greater](https://massive.com/pricing?product=stocks) for real-time stock data. See [Massive pricing](https://massive.com/pricing?product=stocks) for other markets.
+
 1. **Download the XLL.** Grab `massive_excel.xll` from the [latest GitHub release](https://github.com/AlexJReid/zigxll-connectors-wss/releases/latest) and copy it to your Windows machine. Release binaries are code-signed by **Lexvica Limited** via Azure Trusted Signing. If you build from your own fork, sign it with your own code-signing certificate.
-2. **You may need to unblock it it.** Right-click the `.xll`, Properties, tick **Unblock**, OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
+2. **You may need to unblock it.** Right-click the `.xll`, Properties, tick **Unblock**, OK. ([Why Excel blocks XLLs](https://support.microsoft.com/en-gb/topic/excel-is-blocking-untrusted-xll-add-ins-by-default-1e3752e2-1177-4444-a807-7b700266a6fb))
 3. **Drop a `config.json`** in the same directory as the XLL, containing at least your API key:
 
    ```json
    {
      "api_key": "...",
-     // optional
      "host": "socket.massive.com",
      "port": 443,
-     "path": "/stocks", // default market
+     "path": "/stocks"
    }
    ```
 
-   The host (`socket.massive.com`, `delayed.massive.com` and so on) is plan-dependent. See the [Massive WebSocket docs](https://massive.com/docs/websocket/quickstart) for the endpoint that matches whatyou have access to.
+   The host (`socket.massive.com`, `delayed.massive.com` and so on) is plan-dependent. See the [Massive WebSocket docs](https://massive.com/docs/websocket/quickstart) for the endpoint that matches what you have access to.
 
 4. **Load the add-in.** Double-click the `.xll`, or add it via *File, Options, Add-ins, Excel Add-ins, Browse*.
 5. **Try a formula.** In any cell:
@@ -37,7 +38,16 @@ This is an Excel add-in that streams live market data from the [Massive](https:/
    =MASSIVE("AM.AAPL.p")
    ```
 
-   It should start updating with aggregate-minute AAPL trade prices. Depending on time of day, liquidity, aggregation, give it about a minute to update. See next section for the full topic format.
+   It should start updating with aggregate-minute AAPL trade prices. Depending on time of day, liquidity, and aggregation window, give it about a minute to update. See next section for the full topic format.
+
+### Example workbooks
+
+Two example workbooks are included in this repo to get you started:
+
+- [`massive_agg_minute_150.xlsx`](massive_agg_minute_150.xlsx) — live minute-bar OHLCV for 150 stocks using `MASSIVE.STOCKS.AGG_MINUTE`
+- [`massive_agg_second_150.xlsx`](massive_agg_second_150.xlsx) — live second-bar OHLCV for 150 stocks using `MASSIVE.STOCKS.AGG_SECOND`
+
+Both require a [Massive Stocks Starter plan or greater](https://massive.com/pricing?product=stocks).
 
 ## API coverage
 
@@ -365,7 +375,7 @@ The config is read once at startup and cached for the life of the process. Rotat
 ### Build
 
 ```bash
-zig build              # XLL (zig-out/lib/standalone.xll), cross-compiled to Windows
+zig build              # XLL (zig-out/lib/massive_excel.xll), cross-compiled to Windows
 zig build massive-cli  # CLI smoke-tester (zig-out/bin/massive-cli)
 ```
 
