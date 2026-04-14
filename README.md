@@ -461,10 +461,9 @@ Key source files:
 
 ## Known limitations
 
-- **Market access is plan-dependent.** Each market (`stocks`, `options`, `forex`, `crypto`, `indices`, `futures`) is a separate WebSocket endpoint. You can only reach markets your API key is entitled to. The handler opens a connection lazily on the first topic for a market; if auth fails, the worker logs the status message and retries on the 2s reconnect timer. Cells pointed at unauthorised markets stay `#N/A`.
+- **Market access is plan-dependent.** Each market (`stocks`, `options`, `forex`, `crypto`, `indices`, `futures`) is a separate WebSocket endpoint. You can only reach markets your API key is entitled to. The handler opens a connection lazily on the first topic for a market; if auth fails, cells pointed at unauthorised markets stay `#N/A`.
 - **One connection per market.** Massive has no multiplexed endpoint. Each market is its own `wss://.../<market>` URL. The handler holds one connection per active market and shares it across all cells for that market.
 - **One concurrent connection per asset class per API key.** Massive's default cap is one live WebSocket per asset class. Contact Massive support for more. Running two Excel instances against the same key on the same market will fail auth on the second. Its cells stay `#N/A` and the worker exits after logging the terminal error (no reconnect hammering).
-- **Sub/unsub latency between market hours.** Each worker uses a 2s `poll`-gated read (`readMessageTimeout`) so queued sub/unsub actions flush on the next tick even when the server is idle. A client-initiated WS ping every 20s keeps NAT mappings warm. Intraday latency is sub-second. Worst-case off-hours latency is the poll interval.
 - **64 KiB single-frame cap.** Fragmented or huge frames will error. Safe for the Massive wire format, which is small.
 - **Reconnect.** On drop, the worker reconnects with a fixed 2s backoff forever, re-authenticates, and re-subscribes to all currently-live channels.
 
