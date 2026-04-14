@@ -378,8 +378,7 @@ Host, port, default path, TLS behaviour and API key are all set at runtime via `
   "host": "socket.massive.com",
   "port": 443,
   "path": "/stocks",
-  "insecure": false,
-  "api_key": "pk_live_..."
+  "api_key": "..."
 }
 ```
 
