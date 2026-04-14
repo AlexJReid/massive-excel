@@ -14,7 +14,8 @@
 // Each connection is owned by its own worker thread and can only carry
 // channels for that market. Connections are created lazily when the first
 // cell for a market appears, and kept alive (idle) for the remainder of the
-// Excel session.
+// RTD server's lifetime (an RTD server terminates when the very last cell is
+// removed from the workbook).
 //
 // Your access to any given market depends on the plan attached to the API
 // key; unauthorized markets will fail auth (reported via status messages).
@@ -45,7 +46,7 @@ const config = @import("config.zig");
 const gpa = std.heap.c_allocator;
 
 /// CA trust bundle. Fetched once from https://curl.se/ca/cacert.pem and
-/// checked into the repo for reproducible builds.
+/// checked into the repo for reproducible builds. May revisit.
 const ca_bundle_pem = @embedFile("ca_bundle.pem");
 
 // ============================================================================
@@ -323,7 +324,7 @@ const Handler = struct {
             // scan is fine: a single channel rarely has more than a handful of
             // cells pointing at it (typically one per field suffix: .p, .s).
             // When the list empties, the channel has no live subscriptions -
-            // drop it and queue a remote unsubscribe. The owned key is handed off
+            // drop it and queue up a remote unsubscribe over sock. The owned key is handed off
             // to pending_unsub so we don't double-free.
             if (mc.channels.getEntry(channel)) |entry| {
                 const list = entry.value_ptr;
