@@ -4,13 +4,13 @@ This is an Excel add-in that streams live market data from the [Massive](https:/
 
 <img src="doc/wrapper.png" alt="A wrapper function streaming live into a cell" width="75%">
 
-> **Not affiliated with Massive.** An independent, unofficial client. Not endorsed by or associated with Massive. "Massive" and related marks belong to their respective owners and are used here only to describe interoperability. Your use of the Massive API is governed by Massive's own terms.
+> **Experimental with no affiliation.** An independent, unofficial client. Not endorsed by or associated with Massive. "Massive" and related marks belong to their respective owners and are used here only to describe interoperability. Your use of the Massive API is governed by Massive's terms.
 >
 > **You need a paid Massive plan with WebSocket access.** This add-in does not source market data; it is a websocket client to the Massive API that runs within Excel. You supply the API key and the plan in your `config.json`. This is covered in this doc.
 >
-> **Data only. Not financial or trading advice.** No warranty is made as to accuracy, completeness or timeliness.
+> **FYI only. Not financial or trading advice.** This code moves numbers around. No warranty is made as to accuracy, completeness or timeliness at this stage of development.
 >
-> **AI-assisted.** Some of the more repetitive aspects of mirroring the Massive API in Excel were completed by AI agents working from the Massive docs and clients for other languages. Optimizations to the TLS and WSS client was mostly implemented by AI. The output has been checked, but please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues) if you notice something off.
+> **AI-assisted.** Some of the more repetitive aspects of mirroring the Massive API in Excel were completed by AI agents working from the Massive docs and clients for other languages. Optimizations to the TLS and WSS client were mostly implemented by AI. The output has been checked, but please [raise an issue](https://github.com/AlexJReid/zigxll-connectors-wss/issues) if you notice something off.
 
 ## Quick start
 
@@ -395,69 +395,6 @@ The RTD server registers itself in `HKCU\Software\Classes` on load, so no admin 
 ## Smoke-test without Excel (mac/linux/windows)
 
 A native binary that exercises the TLS client, WS framing, auth handshake and JSON dispatch against a local mock server. See [`tools/README.md`](tools/README.md) for the mock server's replay mode, environment variables, and the `fetch_flatfile.js` helper for pulling historical data from Massive's S3 endpoint.
-
-**One-time setup:**
-
-```bash
-./tools/gen_cert.sh      # generate self-signed TLS cert in tools/cert.pem + tools/key.pem
-npm install ws           # install Node WebSocket library
-cat > src/config.json <<'EOF'
-{ "host": "localhost", "port": 8443, "insecure": true, "api_key": "test-key" }
-EOF
-```
-
-**Run:**
-
-```bash
-# terminal 1: start the mock Massive server
-node tools/mock_server.js
-
-# terminal 2: run the native CLI against it (reads src/config.json)
-zig build run-cli -- T.AAPL Q.MSFT AM.TSLA
-
-# to exercise a non-default market path:
-zig build run-cli -- --market crypto XT.BTC-USD
-```
-
-Expected output (on the CLI side):
-
-```
-info(massive_cli): host=localhost port=8443 path=/stocks insecure=true
-warning(massive_cli): TLS verification disabled
-info(massive_cli): connecting...
-info(massive_cli): connected
-info(massive_cli): authenticated
-info(massive_cli): subscribed to 3 channel(s)
-< ev=T sym=AAPL x=4 i="631529681" z=3 p=256.7998 s=363 ...
-< ev=Q sym=MSFT bp=532.6017 bs=259 ap=532.6217 as=54 t=...
-< ev=AM sym=TSLA v=79218 vw=274.6887 o=274 c=274.7387 h=275.2387 l=274.2387 ...
-```
-
-Mock server environment variables:
-- `MOCK_PORT`: default `8443`
-- `MOCK_API_KEY`: default `test-key`
-- `MOCK_TICK_MS`: default `500` (how often to emit a fake event per subscribed channel)
-
-Swap `src/config.json` back to your real key and endpoint before running the CLI against production. The XLL reads its own `config.json` from the directory it was loaded from, so its config is unaffected by CLI mock testing.
-
-### Pointing the XLL at the mock server
-
-Same binary, same rules: the config file picks the endpoint. `./build-for-mock.sh` builds the XLL and writes a `config.json` next to it with `insecure: true`, `api_key: "test-key"` and your LAN IP as the host.
-
-```bash
-./build-for-mock.sh
-# outputs: zig-out/lib/massive_excel.xll + zig-out/lib/config.json
-```
-
-Then on the Windows side:
-
-1. Copy **both** `massive_excel.xll` and `config.json` from `zig-out/lib/` into the **same directory** on the Windows box.
-2. Start the mock server somewhere reachable: `node tools/mock_server.js`.
-3. The mock's self-signed cert doesn't need to match any trust store; `insecure: true` in the config skips verification.
-4. Load the XLL in Excel, type `=MASSIVE("T.AAPL.p")`, confirm fake ticks arrive.
-5. Multi-market smoke test: `=MASSIVE("XT.BTC-USD.p","crypto")` and `=MASSIVE("T.AAPL.p","stocks")` in two cells should open two separate WebSocket connections (the mock accepts any path), and the debug log (OutputDebugString, visible in DebugView) will show `[stocks]` and `[crypto]` worker lines.
-
-**Watch out:** `insecure: true` skips TLS verification for **every** connection the XLL makes, including any real endpoint. Keep mock and prod installs in separate directories. The _config file_, not the binary, is what must never sit next to a production endpoint.
 
 ## Architecture
 
