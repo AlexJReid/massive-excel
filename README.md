@@ -23,13 +23,13 @@ You need a [Massive Stocks Starter plan or greater](https://massive.com/pricing?
    ```json
    {
      "api_key": "...",
-     "host": "socket.massive.com",
+     "host": "delayed.massive.com",
      "port": 443,
      "path": "/stocks"
    }
    ```
 
-   The host (`socket.massive.com`, `delayed.massive.com` and so on) is plan-dependent. See the [Massive WebSocket docs](https://massive.com/docs/websocket/quickstart) for the endpoint that matches what you have access to.
+   Access to the host (`socket.massive.com`, `delayed.massive.com` and so on) is plan-dependent. See the [Massive WebSocket docs](https://massive.com/docs/websocket/quickstart) for the endpoint that aligns with what you have access to.
 
 4. **Load the add-in.** Double-click the `.xll`, or add it via *File, Options, Add-ins, Excel Add-ins, Browse*.
 5. **Try a formula.** In any cell:
